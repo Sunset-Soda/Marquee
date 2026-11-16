@@ -24,7 +24,7 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 
 Grab the latest build from the **Releases** page:
 
-- **Linux:** `Marquee-x86_64.AppImage`. `chmod +x` it and run. The first run adds a menu entry named `io.github.marquee.Marquee.desktop`, which is what lets KDE pin it to the dock. It uses your system's Qt 6 and Kirigami (see Install).
+- **Linux:** `Marquee-x86_64.AppImage`. `chmod +x` it and run. Use a tool like Gear Lever to add it to your menu, or run it once with `--install-desktop` (and `--uninstall-desktop` to remove the entry). It uses your system's Qt 6 and Kirigami (see Install).
 
 ## Install from source
 
