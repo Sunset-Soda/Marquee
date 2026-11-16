@@ -17,8 +17,8 @@ IFACE_ROOT = "org.mpris.MediaPlayer2"
 IFACE_PLAYER = "org.mpris.MediaPlayer2.Player"
 
 
+@ClassInfo({"D-Bus Interface": IFACE_ROOT})
 class _Root(QDBusAbstractAdaptor):
-    ClassInfo({"D-Bus Interface": IFACE_ROOT})
 
     def __init__(self, owner):
         super().__init__(owner)
@@ -41,8 +41,8 @@ class _Root(QDBusAbstractAdaptor):
         pass
 
 
+@ClassInfo({"D-Bus Interface": IFACE_PLAYER})
 class _Player(QDBusAbstractAdaptor):
-    ClassInfo({"D-Bus Interface": IFACE_PLAYER})
 
     def __init__(self, owner):
         super().__init__(owner)
