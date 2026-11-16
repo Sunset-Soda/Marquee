@@ -24,7 +24,7 @@ Qt 6 + Kirigami. Native on KDE Plasma, runs on any Linux desktop and on Windows.
 
 Grab the latest build from the **Releases** page:
 
-- **Linux:** `Marquee-*.AppImage`. `chmod +x` it and run. It uses your system's Qt 6 and Kirigami (see Install).
+- **Linux:** `Marquee-*.AppImage`. `chmod +x` it and run. The first run adds a menu entry named `io.github.marquee.Marquee.desktop`, which is what lets KDE pin it to the dock. It uses your system's Qt 6 and Kirigami (see Install).
 - **Windows:** `Marquee-windows.zip`. Unzip and run `Marquee.exe`. Windows builds are new and less tested than Linux.
 
 ## Install from source
@@ -37,21 +37,7 @@ Python 3.10+ and Qt 6 with Kirigami.
 | Fedora | `python3-pyside6 kf6-kirigami qt6-qtmultimedia` |
 | Debian / Ubuntu | `python3-pyside6.qtquick python3-pyside6.qtmultimedia qml6-module-org-kde-kirigami qml6-module-qtquick-dialogs` (names vary) |
 
-### YouTube tools
-
-YouTube needs `yt-dlp`, `ffmpeg`, `deno` and `yt-dlp-ejs`. Marquee doesn't bundle them on Linux. Keep yt-dlp up to
-date, because YouTube changes often and old versions stop working.
-
-| Distro | Commands |
-|---|---|
-| Arch / CachyOS | `sudo pacman -S yt-dlp ffmpeg deno` then `sudo pacman -S yt-dlp-ejs` (or `pip install --user yt-dlp-ejs`) |
-| Fedora | `sudo dnf install yt-dlp ffmpeg-free` then `pip install --user yt-dlp-ejs` and the Deno install below |
-| Debian / Ubuntu | `sudo apt install ffmpeg pipx` then `pipx install "yt-dlp[default]"` and the Deno install below |
-| openSUSE | `sudo zypper install yt-dlp ffmpeg` then `pip install --user yt-dlp-ejs` and the Deno install below |
-| Windows | `winget install yt-dlp.yt-dlp Gyan.FFmpeg DenoLand.Deno` |
-
-Deno where your distro doesn't package it: `curl -fsSL https://deno.land/install.sh | sh`.
-`pip install --user curl_cffi` is optional and helps with some blocked requests.
+For YouTube also install `yt-dlp`, `deno`, `yt-dlp-ejs` and `ffmpeg` (`curl_cffi` is optional).
 Run with `python3 -m marquee`, or `pip install .[qt]`. `bash install-desktop.sh` adds the app icon to the Linux taskbar.
 
 ## Library features
@@ -61,6 +47,8 @@ search, grid and list views, adjustable cover size, drag and drop, folder import
 parsing (`Movie.1999.1080p.mkv`, `Show.S01E02.mkv`, `Artist - Song.mp3`), MP3 tags and embedded covers, cover
 art lookup (iTunes Search API for movies, music, podcasts and audiobooks; TVmaze for TV), manual cover choice, resume where you stopped (videos only; songs always start from the top), queue with next/previous, and
 subtitles, and three built-in sample tracks so the player works on first launch.
+
+**Media keys:** the keyboard's play/pause, next and previous keys, and your desktop's media widget, control Marquee through MPRIS. They act on the video or channel on screen, otherwise on the music player.
 
 Keys in the player: Space or K play/pause, ←/→ seek 10 s, N / P next / previous, M mute, C subtitles, F fullscreen, Esc back.
 

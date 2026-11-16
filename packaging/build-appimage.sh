@@ -36,6 +36,21 @@ if [ -z "$PY" ] || ! "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))'
     echo "Marquee needs Python 3.10 or newer, installed through your distribution." >&2
     exit 1
 fi
+# Desktop integration. KDE and GNOME match a running window to its launcher by the window's application id
+# (io.github.marquee.Marquee), so the launcher file has to be called exactly io.github.marquee.Marquee.desktop and
+# must start this AppImage. Without that, the window gets a second, temporary dock icon and a pinned icon
+# vanishes when the app closes. Set MARQUEE_NO_INTEGRATION=1 to skip this.
+if [ -n "$APPIMAGE" ] && [ -z "$MARQUEE_NO_INTEGRATION" ]; then
+    DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+    ID=io.github.marquee.Marquee
+    mkdir -p "$DATA/applications" "$DATA/icons/hicolor/scalable/apps" 2>/dev/null
+    WANT="$(sed -e "s|^Exec=.*|Exec=\"$APPIMAGE\" %F|" -e '/^StartupWMClass=/d' -e "/^Icon=/a StartupWMClass=$ID" "$HERE/$ID.desktop")"
+    if [ "$(cat "$DATA/applications/$ID.desktop" 2>/dev/null)" != "$WANT" ]; then
+        printf '%s\n' "$WANT" > "$DATA/applications/$ID.desktop"
+        cp "$HERE/$ID.svg" "$DATA/icons/hicolor/scalable/apps/$ID.svg" 2>/dev/null
+        (command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 &) 2>/dev/null
+    fi
+fi
 export PYTHONPATH="$HERE/usr/lib/marquee${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1      # the image is read-only
 exec "$PY" -m marquee "$@"

@@ -276,8 +276,11 @@ Kirigami.Page {
         }
     }
 
+    property string subBadge: ""
+    Timer { id: subBadgeTimer; interval: 4500; onTriggered: pp.subBadge = "" }
     Connections {
         target: marquee
+        function onSubToast(text) { pp.subBadge = text; subBadgeTimer.restart() }
         function onSubtitleTimingChanged(id, delay) { if (id === pp.itemId) pp.subDelay = delay }
         function onSubtitleTracksReady(id, tracks, sel, note) {
             if (id !== pp.itemId) return
@@ -823,6 +826,7 @@ Kirigami.Page {
         }
     }
     Rectangle {
+        id: upBadge
         visible: !!pp.info.yt && pp.info.upgradeTo > 0 && youtube.upgrading === pp.info.id.substring(3)
         anchors { top: parent.top; right: parent.right; margins: Kirigami.Units.largeSpacing }
         z: 40
@@ -832,5 +836,17 @@ Kirigami.Page {
         height: upLabel.implicitHeight + 8
         Text { id: upLabel; anchors.centerIn: parent; color: "white"; font.pixelSize: 12
                text: "Getting " + pp.info.upgradeTo + "p" + (youtube.note !== "" ? " · " + youtube.note : "…") }
+    }
+    Rectangle {
+        visible: pp.subBadge !== ""
+        anchors { top: parent.top; right: parent.right; margins: Kirigami.Units.largeSpacing }
+        anchors.topMargin: Kirigami.Units.largeSpacing + (upBadge.visible ? upBadge.height + 6 : 0)
+        z: 40
+        radius: 4
+        color: "#99000000"
+        width: Math.min(subBadgeLabel.implicitWidth + 16, pp.width * 0.6)
+        height: subBadgeLabel.implicitHeight + 8
+        Text { id: subBadgeLabel; anchors.centerIn: parent; width: parent.width - 16; color: "white"; font.pixelSize: 12
+               elide: Text.ElideRight; horizontalAlignment: Text.AlignHCenter; text: pp.subBadge }
     }
 }

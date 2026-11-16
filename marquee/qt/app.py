@@ -47,6 +47,13 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
     lib.ensure_samples()
     controller = Controller(lib)
 
+    try:
+        from .mpris import Mpris
+        controller.mpris = Mpris(controller)
+        controller.mpris.command.connect(controller.mediaCommand)
+    except Exception as e:
+        print("marquee: media keys unavailable:", e, file=sys.stderr)
+
     engine = QQmlApplicationEngine()
     youtube = YoutubeController(controller)
     engine.rootContext().setContextProperty("marquee", controller)

@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import QtMultimedia
 import org.kde.kirigami as Kirigami
 
 Kirigami.ApplicationWindow {
@@ -40,6 +41,41 @@ Kirigami.ApplicationWindow {
     // Live TV's single player, shared by the Live TV page's preview and the full-size player.
     readonly property var live: liveEngine
     LiveEngine { id: liveEngine }
+
+    // Media keys and the desktop's media widget (MPRIS, see mpris.py). Whatever is on screen answers the keys:
+    // a video or channel page if one is open, otherwise the music player.
+    readonly property var mediaPage: (pageStack.depth > 1 && pageStack.lastItem && pageStack.lastItem.toggle) ? pageStack.lastItem : null
+    Timer {
+        interval: 700; repeat: true; running: true
+        onTriggered: {
+            var pg = root.mediaPage
+            if (pg && pg.player)
+                marquee.setMediaState(pg.info.title || "", pg.info.sub || "", pg.info.cover || "",
+                                      pg.player.playbackState === MediaPlayer.PlayingState, true)
+            else
+                marquee.setMediaState(musicEngine.info.title || "", musicEngine.info.sub || "", musicEngine.info.cover || "",
+                                      musicEngine.playing, musicEngine.active)
+        }
+    }
+    Connections {
+        target: marquee
+        function onMediaCommand(cmd) {
+            var pg = root.mediaPage
+            var live = pg ? pg.isLive : false
+            if (pg) {
+                var p = pg.player, playing = p.playbackState === MediaPlayer.PlayingState
+                if (cmd === "playpause" || (cmd === "play" && !playing) || (cmd === "pause" && playing)) pg.toggle()
+                else if (cmd === "next") pg.step(1)
+                else if (cmd === "previous") pg.step(-1)
+                else if (cmd === "stop") { p.pause() }
+            } else if (musicEngine.active) {
+                if (cmd === "playpause" || (cmd === "play" && !musicEngine.playing) || (cmd === "pause" && musicEngine.playing)) musicEngine.toggle()
+                else if (cmd === "next") musicEngine.next(false)
+                else if (cmd === "previous") musicEngine.previous()
+                else if (cmd === "stop") musicEngine.stop()
+            }
+        }
+    }
     function openNowPlaying() {
         if (pageStack.depth <= 1 && musicEngine.active)
             pageStack.push(Qt.resolvedUrl("PlayerPage.qml"), { itemId: musicEngine.itemId, music: musicEngine, live: liveEngine })
@@ -208,6 +244,10 @@ Kirigami.ApplicationWindow {
     Connections {
         target: marquee
         function onToast(text) { root.showPassiveNotification(text) }
+        function onSubToast(text) {
+            var page = pageStack.currentItem
+            if (!page || page.subBadge === undefined) root.showPassiveNotification(text)
+        }
     }
 
     FileDialog {

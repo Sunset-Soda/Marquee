@@ -82,6 +82,8 @@ class Controller(QObject):
     collectionsChanged = Signal()
     stateChanged = Signal()
     toast = Signal(str)
+    mediaCommand = Signal(str)        # a media key was pressed: play, pause, playpause, next, previous, stop
+    subToast = Signal(str)            # subtitle progress: shown in the player's corner, or as a toast when no player is open
     # worker threads emit these; Qt queues them onto the main thread
     _refresh = Signal()
     _say = Signal(str)
@@ -408,6 +410,13 @@ class Controller(QObject):
     def subtitleKeySet(self):
         return opensubs.load_credentials().ready
 
+    @Slot(str, str, str, bool, bool)
+    def setMediaState(self, title: str, sub: str, cover: str, playing: bool, active: bool):
+        """The QML side reports what is playing, for the desktop's media controls (see mpris.py)."""
+        m = getattr(self, "mpris", None)
+        if m is not None:
+            m.update(title, sub, cover, playing, active)
+
     @Slot(str)
     def downloadSubtitles(self, item_id: str):
         it = self.lib.by_id(item_id)
@@ -415,13 +424,13 @@ class Controller(QObject):
             return
         creds = opensubs.load_credentials()
         if not creds.ready:
-            self.toast.emit("Add your OpenSubtitles API key in Subtitle Settings first.")
+            self.subToast.emit("Add your OpenSubtitles API key in Subtitle Settings first.")
             return
-        self.toast.emit("Looking for subtitles…")
+        self.subToast.emit("Looking for subtitles…")
 
         def work():
             status, msg, path = opensubs.fetch_for_item(self.lib, it, creds)
-            self._say.emit(msg)
+            self.subToast.emit(msg)
             if status == "ok":
                 self._reopen.emit(item_id)
         threading.Thread(target=work, daemon=True).start()
@@ -677,7 +686,7 @@ class Controller(QObject):
             if creds.ready and creds.auto:
                 it.sub_tried = True                                   # holds off a second try while this one runs
                 self.lib.save()
-                self.toast.emit("No subtitles found. Looking online…")
+                self.subToast.emit("No subtitles found. Looking online…")
                 _log(f"subtitles: none for {it.title!r}, looking online")
 
                 def fetch():
@@ -686,7 +695,7 @@ class Controller(QObject):
                     it.sub_tried = status == "none"                   # a passing failure is tried again next time
                     self.lib.save()
                     if status in ("ok", "error"):
-                        self._say.emit(msg)
+                        self.subToast.emit(msg)
                     if status == "ok":
                         self._reopen.emit(item_id)
                 threading.Thread(target=fetch, daemon=True).start()
@@ -715,7 +724,7 @@ class Controller(QObject):
         if item_id != self._sub_item or track_id != self._sub_sel:
             return
         if not cues:
-            self._say.emit("Couldn’t read subtitles from that track.")
+            self.subToast.emit("Couldn’t read subtitles from that track.")
             return
         self._timeline = subtitles.Timeline(cues)
         it = self.lib.by_id(item_id)
@@ -754,7 +763,7 @@ class Controller(QObject):
         except OSError:
             ok = False
         if not ok:
-            self.toast.emit("Couldn’t read subtitles from that file. Use .srt, .vtt or .ass.")
+            self.subToast.emit("Couldn’t read subtitles from that file. Use .srt, .vtt or .ass.")
             return
         if path not in it.sub_files:
             it.sub_files.append(path)
@@ -766,14 +775,14 @@ class Controller(QObject):
         it = self.lib.by_id(item_id)
         if not it or not self._timeline or not subsync.available():
             if manual:
-                self.toast.emit("Automatic sync needs ffmpeg, which isn’t installed.")
+                self.subToast.emit("Automatic sync needs ffmpeg, which isn’t installed.")
             return
         if item_id in self._syncing:
             return
         self._syncing.add(item_id)
         path, cues = it.path, list(self._timeline.cues)
         if manual:
-            self.toast.emit("Syncing subtitles…")
+            self.subToast.emit("Syncing subtitles…")
 
         def work():
             try:
@@ -801,7 +810,7 @@ class Controller(QObject):
             self._sub_delay, self._sub_scale = it.sub_delay, it.sub_scale
             self.subtitleTimingChanged.emit(item_id, it.sub_delay)
         if manual or (res is not None and res.changed):
-            self.toast.emit(subsync.describe(res))
+            self.subToast.emit(subsync.describe(res))
 
     @Slot(result=bool)
     def autoSyncSubtitles(self):
