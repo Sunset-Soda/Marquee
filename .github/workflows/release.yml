@@ -1,8 +1,13 @@
 name: Release
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the builds to (for example 0.1.1). Leave empty to only build."
+        required: false
+        default: ""
 
 jobs:
   appimage:
@@ -13,9 +18,11 @@ jobs:
       - run: sh packaging/build-appimage.sh
       - uses: actions/upload-artifact@v4
         with: { name: appimage, path: packaging/build/*.AppImage }
-      - if: startsWith(github.ref, 'refs/tags/')
+      - if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
-        with: { files: packaging/build/*.AppImage }
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: packaging/build/*.AppImage
 
   windows:
     # Kirigami has no Windows wheel, so it is built from source against the same Qt that PySide6 ships.
@@ -55,6 +62,8 @@ jobs:
           Compress-Archive dist\Marquee Marquee-windows.zip
       - uses: actions/upload-artifact@v4
         with: { name: windows, path: Marquee-windows.zip }
-      - if: startsWith(github.ref, 'refs/tags/')
+      - if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
-        with: { files: Marquee-windows.zip }
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: Marquee-windows.zip
