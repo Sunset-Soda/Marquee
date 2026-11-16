@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Marquee
+GenericName=Media Library
+Comment=Browse and play your video and music collection
+Exec=marquee %F
+Icon=io.github.marquee.Marquee
+Terminal=false
+Categories=AudioVideo;Audio;Video;Player;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;audio/mpeg;audio/mp4;audio/flac;audio/x-wav;audio/ogg;audio/opus;
+Keywords=media;video;music;movies;player;library;
+StartupNotify=true

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marquee"
+version = "0.1.0"
+description = "Media library and in-app player, native Qt 6 / Kirigami"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+dependencies = []
+
+[project.optional-dependencies]
+qt = ["PySide6>=6.6"]
+
+[project.scripts]
+marquee = "marquee.__main__:main"
+
+[tool.setuptools]
+packages = ["marquee", "marquee.core", "marquee.qt"]
+
+[tool.setuptools.package-data]
+"marquee.qt" = ["qml/*.qml", "qml/*.svg", "icon.svg"]
