@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.marquee.Marquee</id>
+  <name>Marquee</name>
+  <summary>Media library and in-app player</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>Marquee organises your own video and music files in a cover-art library and plays everything inside the
+    app. Cover art is looked up online. The interface is native on KDE Plasma (Qt 6, Kirigami) and on GNOME
+    and other GTK desktops (GTK 4, libadwaita).</p>
+  </description>
+  <launchable type="desktop-id">io.github.marquee.Marquee.desktop</launchable>
+  <provides><binary>marquee</binary></provides>
+  <categories><category>AudioVideo</category><category>Player</category></categories>
+  <content_rating type="oars-1.1"/>
+  <supports><control>pointing</control><control>keyboard</control><control>touch</control></supports>
+  <requires><display_length compare="ge">360</display_length></requires>
+</component>
