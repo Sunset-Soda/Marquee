@@ -128,7 +128,10 @@ class Mpris(QObject):
             return
         try:
             msg = QDBusMessage.createSignal(PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged")
-            msg.setArguments([IFACE_PLAYER, changed, []])
+            # The third argument must be a string array ("as"). A plain empty Python list is sent as "av", and
+            # Plasma's media code then ignores the whole signal, so it never learns that playback started.
+            # Rate never changes, so naming it as "invalidated" is harmless: clients just read it again.
+            msg.setArguments([IFACE_PLAYER, changed, ["Rate"]])
             QDBusConnection.sessionBus().send(msg)
         except Exception as e:
             print("marquee: media keys:", e, file=sys.stderr)
