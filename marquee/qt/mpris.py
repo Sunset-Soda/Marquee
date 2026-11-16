@@ -98,6 +98,7 @@ class Mpris(QObject):
                 print("marquee: media keys: could not claim", SERVICE, file=sys.stderr)
                 return
             self.ok = bus.registerObject(PATH, self, QDBusConnection.ExportAdaptors)
+            print("marquee: media keys:", "registered as " + SERVICE if self.ok else "could not register the D-Bus object", file=sys.stderr)
         except Exception as e:                                   # never let this stop the app
             print("marquee: media keys unavailable:", e, file=sys.stderr)
 
