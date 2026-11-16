@@ -37,7 +37,21 @@ Python 3.10+ and Qt 6 with Kirigami.
 | Fedora | `python3-pyside6 kf6-kirigami qt6-qtmultimedia` |
 | Debian / Ubuntu | `python3-pyside6.qtquick python3-pyside6.qtmultimedia qml6-module-org-kde-kirigami qml6-module-qtquick-dialogs` (names vary) |
 
-For YouTube also install `yt-dlp`, `deno`, `yt-dlp-ejs` and `ffmpeg` (`curl_cffi` is optional).
+### YouTube tools
+
+YouTube needs `yt-dlp`, `ffmpeg`, `deno` and `yt-dlp-ejs`. Marquee doesn't bundle them on Linux. Keep yt-dlp up to
+date, because YouTube changes often and old versions stop working.
+
+| Distro | Commands |
+|---|---|
+| Arch / CachyOS | `sudo pacman -S yt-dlp ffmpeg deno` then `sudo pacman -S yt-dlp-ejs` (or `pip install --user yt-dlp-ejs`) |
+| Fedora | `sudo dnf install yt-dlp ffmpeg-free` then `pip install --user yt-dlp-ejs` and the Deno install below |
+| Debian / Ubuntu | `sudo apt install ffmpeg pipx` then `pipx install "yt-dlp[default]"` and the Deno install below |
+| openSUSE | `sudo zypper install yt-dlp ffmpeg` then `pip install --user yt-dlp-ejs` and the Deno install below |
+| Windows | `winget install yt-dlp.yt-dlp Gyan.FFmpeg DenoLand.Deno` |
+
+Deno where your distro doesn't package it: `curl -fsSL https://deno.land/install.sh | sh`.
+`pip install --user curl_cffi` is optional and helps with some blocked requests.
 Run with `python3 -m marquee`, or `pip install .[qt]`. `bash install-desktop.sh` adds the app icon to the Linux taskbar.
 
 ## Library features
