@@ -1,7 +1,7 @@
 <p align="center"><img src="data/io.github.marquee.Marquee.svg" width="96" alt="Marquee"></p>
 <h1 align="center">Marquee</h1>
 <p align="center">A media library and player for your own movies, TV and music, with YouTube and Live TV built in.<br>
-Qt 6 + Kirigami. Native on KDE Plasma, runs on any Linux desktop and on Windows.</p>
+Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows build is planned.</p>
 
 ## Screenshots
 
@@ -25,7 +25,6 @@ Qt 6 + Kirigami. Native on KDE Plasma, runs on any Linux desktop and on Windows.
 Grab the latest build from the **Releases** page:
 
 - **Linux:** `Marquee-*.AppImage`. `chmod +x` it and run. The first run adds a menu entry named `io.github.marquee.Marquee.desktop`, which is what lets KDE pin it to the dock. It uses your system's Qt 6 and Kirigami (see Install).
-- **Windows:** `Marquee-windows.zip`. Unzip and run `Marquee.exe`. Windows builds are new and less tested than Linux.
 
 ## Install from source
 
