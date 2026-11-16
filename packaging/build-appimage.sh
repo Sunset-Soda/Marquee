@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Marquee-<version>-<arch>.AppImage from this source tree.
+# Builds Marquee-<arch>.AppImage from this source tree.
 #
 #   sh packaging/build-appimage.sh              build the AppDir, then pack it (needs internet once, for appimagetool)
 #   sh packaging/build-appimage.sh --appdir     only build packaging/build/Marquee.AppDir, which you can run directly
@@ -68,5 +68,5 @@ if [ ! -x "$TOOL" ]; then
     chmod +x "$TOOL"
 fi
 # APPIMAGE_EXTRACT_AND_RUN lets appimagetool itself run on systems without FUSE.
-ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$OUT/Marquee-$VERSION-$ARCH.AppImage"
-echo "Built: $OUT/Marquee-$VERSION-$ARCH.AppImage"
+ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$OUT/Marquee-$ARCH.AppImage"
+echo "Built: $OUT/Marquee-$ARCH.AppImage"
