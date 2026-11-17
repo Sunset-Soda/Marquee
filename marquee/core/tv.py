@@ -26,12 +26,16 @@ def search(query: str, fetch: Fetch = net.get) -> list[dict]:
     return json.loads(fetch(f"{API}/search/shows?" + urllib.parse.urlencode({"q": query})))
 
 
-def best_match(results: list[dict], name: str, year: int = 0) -> dict | None:
+def best_match(results: list[dict], name: str, year: int = 0, rank: Callable[[dict], float] | None = None) -> dict | None:
     """Choose the right series from search results.
 
     An exact name wins over a looser one, a matching premiere year wins among exact names, and TVmaze's own
     relevance score breaks the rest. A result whose name does not even contain what we searched is rejected,
     so a wrong show is never matched silently.
+
+    When several shows tie on name and year (an original and its reboot, both called "Scrubs"), `rank` is asked
+    about each tied show and the highest wins before TVmaze's score is consulted. The library passes how many of the
+    user's own episodes each show actually has.
     """
     want = _norm(name)
     ranked = []
@@ -42,7 +46,27 @@ def best_match(results: list[dict], name: str, year: int = 0) -> dict | None:
             continue
         premiered = (show.get("premiered") or "")[:4]
         ranked.append((got == want, bool(year) and premiered == str(year), r.get("score") or 0, show))
-    return max(ranked, key=lambda t: t[:3])[3] if ranked else None
+    if not ranked:
+        return None
+    top = max(t[:2] for t in ranked)
+    tied = [t for t in ranked if t[:2] == top]
+    if rank and len(tied) > 1:
+        return max(tied, key=lambda t: (rank(t[3]), t[2]))[3]
+    return max(tied, key=lambda t: t[2])[3]
+
+
+def have_episodes(lib: Library, key: str) -> set[tuple[int, int]]:
+    """(season, episode) of every numbered episode the user has of this show."""
+    return {(it.season, it.episode) for it in lib.items if it.show_key == key and it.episode and it.episode > 0}
+
+
+def _coverage(show: dict, have: set[tuple[int, int]], fetch: Fetch) -> int:
+    """How many of the user's episodes this TVmaze show really has."""
+    try:
+        eps = json.loads(fetch(f"{API}/shows/{show['id']}/episodes"))
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TimeoutError):
+        return 0
+    return len(have & {(e.get("season"), e.get("number")) for e in eps})
 
 
 def _image(img: dict | None) -> str:
@@ -67,7 +91,10 @@ def apply(lib: Library, key: str, show: dict, seasons: list[dict], episodes: lis
     Returns how many of the user's episodes were given a real name.
     """
     info = lib.ensure_show(key, show.get("name", ""), 0)
-    info.tvmaze_id = int(show.get("id") or 0)
+    new_id = int(show.get("id") or 0)
+    if new_id != info.tvmaze_id:
+        info.imdb, info.imdb_of = "", 0      # the IMDb number belongs to the old match: look it up again for this show
+    info.tvmaze_id = new_id
     info.name = show.get("name") or info.name
     info.year = int((show.get("premiered") or "0")[:4] or 0) or info.year
     poster = _download(lib, f"show-{key}", _image(show.get("image")), fetch)
@@ -110,14 +137,18 @@ def scrub(lib: Library, key: str, query: str = "", force: bool = False, fetch: F
         return "none", key, 0
     try:
         show = None
+        have = have_episodes(lib, key)
+        rank = (lambda sh: _coverage(sh, have, fetch)) if have else None
         if info.tvmaze_id and force and not query:
             show = json.loads(fetch(f"{API}/shows/{info.tvmaze_id}"))
-        else:
+            if have and _coverage(show, have, fetch) < 0.8 * len(have):
+                show = None                                   # the stored match lacks most of the user's episodes: search again
+        if show is None:
             text = query.strip() or info.name
             name, year = parse.split_year(text)
-            show = best_match(search(text, fetch), name, year or info.year)
+            show = best_match(search(text, fetch), name, year or (0 if info.tvmaze_id else info.year), rank)
             if not show and year:
-                show = best_match(search(name, fetch), name, year)
+                show = best_match(search(name, fetch), name, year, rank)
         if not show:
             return "none", query.strip() or info.name, 0
         sid = show["id"]

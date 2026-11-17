@@ -220,6 +220,24 @@ def parse_music_path(path: str | Path, tags: dict | None = None) -> dict:
     return {"kind": "music", "title": title or p.stem, "sub": artist, "album": album, "track": track, "disc": disc}
 
 
+@lru_cache(maxsize=256)
+def _compact_numbering(folder: str, season: int) -> bool:
+    """True when the videos in a season folder are numbered season-then-episode (101, 102 ... in Season 1, 201 ... in
+    Season 2): every file that starts with a number has the season's digits first. A folder with any other numbering
+    (a daily show with a real episode 105, say) is left alone."""
+    try:
+        with os.scandir(folder) as it:
+            names = [e.name for e in it if e.is_file() and media_of(e.name) == "video" and not is_extra_name(e.name)]
+    except OSError:
+        return False
+    nums = []
+    for name in names:
+        m = re.match(r"\s*(\d{1,4})(?!\d)", re.sub(r"[._]+", " ", Path(name).stem))
+        if m:
+            nums.append(int(m.group(1)))
+    return bool(nums) and all(n >= 100 and n // 100 == season and 1 <= n % 100 <= 99 for n in nums)
+
+
 def parse_path(path: str | Path) -> dict:
     """Like parse_name, but a TV show folder layout decides the show, so files in one show folder
     always land in one show: Ted/Season 1/ep.mkv, Ted/Season 02/03 - Title.mkv, Ted/Specials/Making of.mkv."""
@@ -246,7 +264,11 @@ def parse_path(path: str | Path) -> dict:
     n = re.search(r"(?<!\d)(\d{1,3})(?!\d)", stem)
     if n:
         rest = re.sub(r"^[\s\-–]*(?:e|ep|episode)?\s?\d{1,3}[\s\-–]*", "", stem[n.start():], flags=re.I).strip()
-        return _episode_info(show, year, season, int(n.group(1)), rest)
+        number = int(n.group(1))
+        if season > 0 and n.start() == 0 and number >= 100 and number // 100 == season and 1 <= number % 100 <= 99 \
+                and _compact_numbering(str(p.parent), season):
+            number %= 100                          # "103 - Title" in Season 1 is episode 3: season digit(s) then two digits
+        return _episode_info(show, year, season, number, rest)
     return _episode_info(show, year, season, 0, stem)       # no number at all, such as a "Making of" special
 
 

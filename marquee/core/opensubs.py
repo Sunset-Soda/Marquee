@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from . import subtitles
+from . import subdl, subtitles
 from .library import Item, Library, cache_dir, data_dir
 
 API = "https://api.opensubtitles.com/api/v1"
@@ -40,10 +40,11 @@ class Credentials:
     password: str = ""
     language: str = ""
     auto: bool = True
+    subdl_key: str = ""         # optional second source, used when OpenSubtitles finds nothing or cannot be used
 
     @property
     def ready(self) -> bool:
-        return bool(self.api_key.strip())
+        return bool(self.api_key.strip() or self.subdl_key.strip())
 
 
 def _cred_path() -> Path:
@@ -57,7 +58,7 @@ def load_credentials() -> Credentials:
         raw = {}
     c = Credentials(api_key=str(raw.get("api_key", "")), username=str(raw.get("username", "")),
                     password=str(raw.get("password", "")), language=str(raw.get("language", "")),
-                    auto=bool(raw.get("auto", True)))
+                    auto=bool(raw.get("auto", True)), subdl_key=str(raw.get("subdl_key", "")))
     if not c.language:
         c.language = (os.environ.get("LANG", "en") or "en").split("_")[0].split(".")[0].lower() or "en"
         if c.language == "c" or len(c.language) not in (2, 3):
@@ -69,7 +70,8 @@ def save_credentials(c: Credentials) -> None:
     path = _cred_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps({"api_key": c.api_key.strip(), "username": c.username.strip(), "password": c.password,
-                       "language": c.language.strip().lower() or "en", "auto": c.auto}, indent=2)
+                       "language": c.language.strip().lower() or "en", "auto": c.auto,
+                       "subdl_key": c.subdl_key.strip()}, indent=2)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # private to you
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(data)
@@ -224,10 +226,13 @@ def imdb_id(lib: Library, item: Item, request: Request) -> str:
     info = lib.shows.get(item.show_key) if item.kind == "show" else None
     if not info or not info.tvmaze_id:
         return ""
+    if getattr(info, "imdb_of", 0) != info.tvmaze_id:        # read for another match (or before matches were tracked)
+        info.imdb = ""
     if not getattr(info, "imdb", ""):
         try:
             raw = json.loads(request("GET", f"https://api.tvmaze.com/shows/{info.tvmaze_id}", None, {"Accept": "application/json"}) or b"{}")
             info.imdb = str((raw.get("externals") or {}).get("imdb") or "").lstrip("t") or "-"
+            info.imdb_of = info.tvmaze_id
             lib.save()
         except Exception:
             return ""
@@ -363,51 +368,100 @@ def destination(item: Item, language: str) -> Path:
     return cache_dir() / "subs" / "downloaded" / f"{item.id}.{language}.srt"
 
 
+def _from_opensubtitles(lib: Library, item: Item, creds: Credentials, request: Request, lang: str, want, others) -> tuple[str, str]:
+    """(subtitle text, why there is none). Raises SubError for a failure that is worth telling the user about."""
+    client = Client(creds, request)
+    candidates: list[dict] = []
+    for q in queries_for(lib, item, lang, imdb_id(lib, item, request)):
+        for page in ((1, 2, 3) if want else (1,)):            # the right episode may not be on the first page
+            found = client.search({**q, "page": page})
+            candidates += [r for r in ranked(found, False, Path(item.path).stem, want) if r not in candidates]
+            if candidates or not found:
+                break
+        if candidates:
+            break
+    if not candidates:
+        return "", "No subtitles found for this one."
+    for best in candidates[:2]:                               # downloads are limited per day, so only two tries
+        a = best["attributes"]
+        _log(f"subtitles for {Path(item.path).name}: trying {a.get('release')!r} "
+             f"{(a.get('files') or [{}])[0].get('file_name')!r} {a.get('feature_details')}")
+        cand = subtitles.decode(client.download(a["files"][0]["file_id"]))
+        cues = subtitles.parse(cand, "x.srt")
+        if not cues:
+            raise SubError("The downloaded subtitle file was empty or not readable.")
+        d = dialogue(cues)
+        clash = next((o for o, od in others if same_dialogue(d, od)), None)
+        if clash:
+            _log(f"rejected: it says the same as S{clash.season:02d}E{clash.episode:02d}, not this episode")
+            continue
+        return cand, ""
+    return "", "The only subtitles found were for a different episode."
+
+
+def _from_subdl(lib: Library, item: Item, creds: Credentials, request: Request, lang: str, want, others) -> tuple[str, str]:
+    """The same, from Subdl. Raises subdl.SubdlError."""
+    info = lib.shows.get(item.show_key) if item.kind == "show" else None
+    if item.kind == "show":
+        name, year = (info.name if info and info.name else item.title), (info.year if info and info.year else 0)
+    else:
+        name, year = item.title, (item.sub if item.sub.isdigit() else 0)
+    imdb = imdb_id(lib, item, request) if item.kind == "show" else ""
+    q = subdl.query_for(creds.subdl_key, item.kind, name, year, item.season, item.episode, imdb, lang)
+    _log(f"subtitles for {Path(item.path).name}: trying Subdl ({'imdb ' + imdb if imdb else 'by name'}; "
+         f"show {name!r} {year or ''}, TVmaze #{info.tvmaze_id if info else '-'})")
+    found = subdl.pick(subdl.search(q, request), Path(item.path).stem, want)
+    if not found and imdb and want:                           # not under that number: try the name
+        found = subdl.pick(subdl.search(subdl.query_for(creds.subdl_key, item.kind, name, year, item.season, item.episode, "", lang), request),
+                           Path(item.path).stem, want)
+    if not found:
+        _log("subdl: nothing usable for this episode")
+        return "", "No subtitles found for this one."
+    for sub in found[:2]:
+        cand = subtitles.decode(subdl.download(sub, request, want))
+        cues = subtitles.parse(cand, "x.srt")
+        if not cues:
+            continue
+        d = dialogue(cues)
+        if next((o for o, od in others if same_dialogue(d, od)), None):
+            _log("rejected: Subdl's subtitle says the same as another episode's")
+            continue
+        _log(f"subtitles for {Path(item.path).name}: using Subdl's {sub.get('release_name') or sub.get('name')!r}")
+        return cand, ""
+    return "", "The only subtitles found were for a different episode."
+
+
 def fetch_for_item(lib: Library, item: Item, creds: Credentials | None = None, request: Request = http) -> tuple[str, str, str]:
     """Find and save the best subtitle for a video. Returns (status, message, saved path). Blocking: use a worker thread.
-    status is "ok", "none" (nothing found), "nokey" (not set up) or "error"."""
+    OpenSubtitles is tried first; Subdl (when a key is set) is the backup, including when OpenSubtitles can't be used
+    (key rejected, daily limit reached). status is "ok", "none" (nothing found), "nokey" (not set up) or "error"."""
     creds = creds or load_credentials()
     if not creds.ready:
         return "nokey", "Add your OpenSubtitles API key in Subtitle Settings to download subtitles.", ""
     if item.media != "video" or not item.exists:
         return "none", "Subtitles can only be downloaded for videos that are on disk.", ""
-    client = Client(creds, request)
     lang = creds.language or "en"
+    source = "OpenSubtitles"
     try:
-        best = None
         want = (item.season, item.episode) if item.kind == "show" and item.episode > 0 else None
-        candidates: list[dict] = []
-        for q in queries_for(lib, item, lang, imdb_id(lib, item, request)):
-            for page in ((1, 2, 3) if want else (1,)):        # the right episode may not be on the first page
-                found = client.search({**q, "page": page})
-                candidates += [r for r in ranked(found, False, Path(item.path).stem, want)
-                               if r not in candidates]
-                if candidates or not found:
-                    break
-            if candidates:
-                break
-        if not candidates:
-            return "none", "No subtitles found for this one.", ""
         others = other_episodes_dialogue(lib, item) if want else []
-        text = ""
-        for best in candidates[:2]:                           # downloads are limited per day, so only two tries
-            a = best["attributes"]
-            _log(f"subtitles for {Path(item.path).name}: trying {a.get('release')!r} "
-                 f"{(a.get('files') or [{}])[0].get('file_name')!r} {a.get('feature_details')}")
-            data = client.download(a["files"][0]["file_id"])
-            cand = subtitles.decode(data)
-            cues = subtitles.parse(cand, "x.srt")
-            if not cues:
-                return "error", "The downloaded subtitle file was empty or not readable.", ""
-            d = dialogue(cues)
-            clash = next((o for o, od in others if same_dialogue(d, od)), None)
-            if clash:
-                _log(f"rejected: it says the same as S{clash.season:02d}E{clash.episode:02d}, not this episode")
-                continue
-            text = cand
-            break
+        text, note, problem = "", "No subtitles found for this one.", ""
+        if creds.api_key.strip():
+            try:
+                text, note = _from_opensubtitles(lib, item, creds, request, lang, want, others)
+            except SubError as e:
+                problem = str(e)
+        if not text and creds.subdl_key.strip():
+            source = "Subdl"
+            try:
+                text, note2 = _from_subdl(lib, item, creds, request, lang, want, others)
+                note = note2 or note
+            except subdl.SubdlError as e:
+                problem = problem or str(e)
         if not text:
-            return "none", "The only subtitles found were for a different episode.", ""
+            if problem:
+                return "error", problem, ""
+            return "none", note, ""
         for have in _files_of(item):                          # the same file again: keep the one already there
             try:
                 if Path(have).read_text(encoding="utf-8", errors="ignore") == text:
@@ -430,4 +484,4 @@ def fetch_for_item(lib: Library, item: Item, creds: Credentials | None = None, r
     item.sub_sel = "f:" + str(dest)
     lib.save()
     name = subtitles.LANG.get(lang, lang.upper())
-    return "ok", f"Downloaded {name} subtitles", str(dest)
+    return "ok", f"Downloaded {name} subtitles" + (f" from {source}" if source != "OpenSubtitles" else ""), str(dest)

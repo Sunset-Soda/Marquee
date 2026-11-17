@@ -113,6 +113,7 @@ class Show:
     episodes: dict = field(default_factory=dict)      # "1:3" -> {"name": str, "airdate": str}
     matched: bool = False
     imdb: str = ""                                    # IMDb number from TVmaze, '-' when it has none
+    imdb_of: int = 0                                  # the TVmaze id that `imdb` was read for (a match changed later makes it stale)
 
 
 def probe_tags(path: str, timeout: float = 6.0) -> tuple[float, dict]:
@@ -237,6 +238,27 @@ class Library:
                 self.shows[s.key] = s
         self._backfill_shows()
         return self
+
+    def repair_episode_numbers(self) -> int:
+        """Once: an earlier version read "103 - Title" in a Season 1 folder as episode 103. Read those again with the
+        current rules. Returns how many episodes changed."""
+        if self.prefs.get("ep_compact_v1"):
+            return 0
+        changed = 0
+        for it in self.items:
+            if it.kind != "show" or it.episode < 100 or not it.path:
+                continue
+            info = parse.parse_path(it.path)
+            if info.get("kind") == "show" and info["episode"] != it.episode and info["episode"] < 100:
+                it.season, it.episode = info["season"], info["episode"]
+                it.sub = info["sub"]
+                it.sub_tried = False                         # its subtitles were searched for under the wrong number
+                if it.title_auto:
+                    it.title = info["title"]
+                changed += 1
+        self.prefs["ep_compact_v1"] = True
+        self.save()
+        return changed
 
     def _backfill_shows(self) -> None:
         """Libraries saved before shows existed: give old TV items a show, season and episode."""
