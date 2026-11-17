@@ -7,7 +7,7 @@ import time as _time
 from PySide6.QtCore import (Property, QAbstractListModel, QByteArray, QModelIndex, QObject, QUrl, Qt, Signal, Slot)
 from PySide6.QtGui import QImage
 
-from ..core import artwork, iptv, lyrics, opensubs, palette, playqueue, spectrum, subsync, subtitles, tv
+from ..core import artwork, iptv, lyrics, opensubs, palette, playqueue, spectrum, sponsorblock, subsync, subtitles, tv
 from ..core.library import ALL, KIND, KINDS, Item, Library, path_kind
 from ..core.nav import Navigator, View
 
@@ -83,6 +83,7 @@ class Controller(QObject):
     stateChanged = Signal()
     toast = Signal(str)
     mediaCommand = Signal(str)        # a media key was pressed: play, pause, playpause, next, previous, stop
+    sponsorReady = Signal(str, "QVariantList")      # item id, [[start, end, label], ...] to skip
     subToast = Signal(str)            # subtitle progress: shown in the player's corner, or as a toast when no player is open
     # worker threads emit these; Qt queues them onto the main thread
     _refresh = Signal()
@@ -131,6 +132,8 @@ class Controller(QObject):
         self._sync_done.connect(self._on_sync_done)
         self._reopen.connect(self._reopen_current)
         self.yt_neighbor = None
+        self._lyric_dur: dict[str, float] = {}                   # length of the recording each song's lyric timings were made for
+        self.ytm_lyrics = None                                   # set by YtMusicController: the service's own lyrics for a video id
         self.yt_save = None                                      # set by YoutubeController: remembers where a video stopped
         self.yt_info: dict = {}                                  # YouTube videos being played (see youtube_ctl.py)
         self._live = iptv.Store()
@@ -147,6 +150,8 @@ class Controller(QObject):
         """Older libraries: read the picture out of music files that have none, then share it across each album."""
         try:
             if self.lib.fill_embedded_art():
+                self._refresh.emit()
+            if self.lib.repair_episode_numbers():
                 self._refresh.emit()
             opensubs.reset_stale_attempts(self.lib)
             opensubs.repair_duplicates(self.lib)
@@ -399,11 +404,11 @@ class Controller(QObject):
     @Slot(result="QVariantMap")
     def subtitleSettings(self):
         c = opensubs.load_credentials()
-        return {"apiKey": c.api_key, "username": c.username, "password": c.password, "language": c.language, "auto": c.auto}
+        return {"apiKey": c.api_key, "username": c.username, "password": c.password, "language": c.language, "auto": c.auto, "subdlKey": c.subdl_key}
 
-    @Slot(str, str, str, str, bool)
-    def saveSubtitleSettings(self, key: str, user: str, password: str, language: str, auto: bool):
-        opensubs.save_credentials(opensubs.Credentials(key, user, password, language, auto))
+    @Slot(str, str, str, str, bool, str)
+    def saveSubtitleSettings(self, key: str, user: str, password: str, language: str, auto: bool, subdl_key: str = ""):
+        opensubs.save_credentials(opensubs.Credentials(key, user, password, language, auto, subdl_key))
         self.toast.emit("Subtitle settings saved")
 
     @Property(bool, notify=stateChanged)
@@ -424,7 +429,7 @@ class Controller(QObject):
             return
         creds = opensubs.load_credentials()
         if not creds.ready:
-            self.subToast.emit("Add your OpenSubtitles API key in Subtitle Settings first.")
+            self.subToast.emit("Add an OpenSubtitles or Subdl API key in Subtitle Settings first.")
             return
         self.subToast.emit("Looking for subtitles…")
 
@@ -558,7 +563,7 @@ class Controller(QObject):
     def itemInfo(self, item_id: str):
         if item_id.startswith("live:"):
             return self._live_info(item_id[5:])
-        if item_id.startswith("yt:"):
+        if item_id.startswith(("yt:", "ytm:")):
             return self.yt_info.get(item_id, {})
         it = self.lib.by_id(item_id)
         if not it:
@@ -577,7 +582,21 @@ class Controller(QObject):
         except Exception:
             return palette.fallback("").as_dict()
 
+    @staticmethod
+    def palette_from_image(img):
+        """Colours for the Now Playing backdrop from a QImage of the cover, or None if it is empty."""
+        if img.isNull():
+            return None
+        side = min(img.width(), img.height())
+        img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
+        img = img.scaled(40, 40, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).convertToFormat(QImage.Format_RGBA8888)
+        return palette.from_pixels((c.red(), c.green(), c.blue(), c.alpha())
+                                   for c in (img.pixelColor(x, y) for y in range(40) for x in range(40)))
+
     def _palette_for(self, item_id: str):
+        if item_id.startswith("ytm:"):                         # YouTube Music: coloured once its cover has been fetched
+            info = self.yt_info.get(item_id) or {}
+            return self._palettes.get("c:" + info.get("cover", "")) or palette.fallback(info.get("title", "")).as_dict()
         it = self.lib.by_id(item_id)
         if not it:
             return palette.fallback("").as_dict()
@@ -586,13 +605,7 @@ class Controller(QObject):
         if key not in self._palettes:
             pal = None
             if art:
-                img = QImage(art)
-                if not img.isNull():
-                    side = min(img.width(), img.height())
-                    img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
-                    img = img.scaled(40, 40, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).convertToFormat(QImage.Format_RGBA8888)
-                    pal = palette.from_pixels((c.red(), c.green(), c.blue(), c.alpha())
-                                              for c in (img.pixelColor(x, y) for y in range(40) for x in range(40)))
+                pal = self.palette_from_image(QImage(art))
             self._palettes[key] = (pal or palette.fallback(it.title)).as_dict()
         return self._palettes[key]
 
@@ -600,11 +613,15 @@ class Controller(QObject):
     def startVisualizer(self, item_id: str):
         """Start reading the levels of an audio file. False when ffmpeg is missing, so the screen shows resting bars."""
         self.stopVisualizer()
-        it = self.lib.by_id(item_id)
-        if not it or it.media != "audio" or not it.exists or not spectrum.available():
+        if item_id.startswith("ytm:"):                          # YouTube Music: read the levels from the stream itself
+            src = (self.yt_info.get(item_id) or {}).get("url", "")
+        else:
+            it = self.lib.by_id(item_id)
+            src = it.path if it and it.media == "audio" and it.exists else ""
+        if not src or not spectrum.available():
             return False
         try:
-            self._analyzer = spectrum.Analyzer(it.path).start()
+            self._analyzer = spectrum.Analyzer(src).start()
         except Exception:
             self._analyzer = None
             return False
@@ -850,6 +867,11 @@ class Controller(QObject):
         if it and it.media == "audio":
             self._pq.start(self._queue, item_id)
 
+    def start_queue_ids(self, ids: list[str], current: str) -> None:
+        """A queue that is not made of library items (YouTube Music): play on through `ids` from `current`."""
+        self._queue = list(ids)
+        self._pq.start(self._queue, current)
+
     # ---- music: shuffle, repeat and the track after this one ------------
     @Property(bool, notify=playbackModeChanged)
     def shuffle(self):
@@ -1046,6 +1068,15 @@ class Controller(QObject):
     # ---- lyrics ------------------------------------------------------
     @Slot(str)
     def loadLyrics(self, item_id: str):
+        if item_id.startswith("ytm:"):
+            info = self.yt_info.get(item_id) or {}
+
+            def work_ytm():
+                own = (lambda: self.ytm_lyrics(item_id[4:])) if self.ytm_lyrics else None
+                self._lyrics_done.emit(item_id, lyrics.lookup_track(info.get("sub", ""), info.get("title", ""), info.get("album", ""),
+                                                                     float(info.get("dur") or 0), first=own))
+            threading.Thread(target=work_ytm, daemon=True).start()
+            return
         it = self.lib.by_id(item_id)
         if not it or it.media != "audio":
             return
@@ -1055,8 +1086,92 @@ class Controller(QObject):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_lyrics_done(self, item_id: str, got):
+        self._lyric_dur[item_id] = got.duration if got else 0.0
         _log(f"lyrics for {item_id}: " + (f"{len(got.lines)} lines, {'timed' if got.synced else 'plain'}, from {got.source}" if got else "none"))
         self.lyricsReady.emit(item_id, got.as_rows() if got else [], bool(got and got.synced), got.source if got else "")
+
+    # ---- SponsorBlock ----------------------------------------------------
+    @Slot(result=bool)
+    def sponsorBlockOn(self):
+        return bool(self.lib.prefs.get("sponsorblock", True))
+
+    @Slot(bool)
+    def setSponsorBlock(self, on: bool):
+        self.lib.prefs["sponsorblock"] = bool(on)
+        self.lib.save()
+
+    def _sponsor_cats(self) -> list[str]:
+        got = self.lib.prefs.get("sponsor_categories")
+        return [c for c in got if c in sponsorblock.CATEGORIES] if isinstance(got, list) else list(sponsorblock.DEFAULT)
+
+    @Slot(result="QVariantList")
+    def sponsorCategories(self):
+        """Every kind of part that can be skipped, as [key, label, chosen]."""
+        on = self._sponsor_cats()
+        return [[k, label, k in on] for k, label in sponsorblock.CATEGORIES.items()]
+
+    @Slot(str, bool)
+    def setSponsorCategory(self, key: str, chosen: bool):
+        on = [c for c in self._sponsor_cats() if c != key]
+        if chosen and key in sponsorblock.CATEGORIES:
+            on.append(key)
+        self.lib.prefs["sponsor_categories"] = [k for k in sponsorblock.CATEGORIES if k in on]   # keep a steady order
+        self.lib.save()
+
+    @Slot(str)
+    def loadSponsorSegments(self, item_id: str):
+        """Look up what to skip in a YouTube video; the answer arrives as `sponsorReady`."""
+        if not item_id.startswith("yt:") or not self.sponsorBlockOn():
+            self.sponsorReady.emit(item_id, [])
+            return
+        vid = item_id[3:]
+
+        def work():
+            got = sponsorblock.merge(sponsorblock.segments(vid, self._sponsor_cats()))
+            _log(f"sponsorblock {vid}: {len(got)} part(s) to skip")
+            self.sponsorReady.emit(item_id, [[a, b, sponsorblock.CATEGORIES.get(c, c)] for a, b, c in got])
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str, result=float)
+    def lyricOffset(self, item_id: str):
+        """Seconds to shift this song's lyrics, set by hand when they run early or late."""
+        return float((self.lib.prefs.get("lyric_offsets") or {}).get(item_id, 0.0))
+
+    @Slot(str, float)
+    def refineLyrics(self, item_id: str, audio_seconds: float):
+        """The audio is a different length from the recording the lyrics were timed for: look for a version that fits it."""
+        if not item_id.startswith("ytm:") or audio_seconds <= 0:
+            return
+        info = self.yt_info.get(item_id) or {}
+
+        def work():
+            got = lyrics.refine(info.get("sub", ""), info.get("title", ""), info.get("album", ""), audio_seconds)
+            _log(f"lyrics for {item_id}: " + (f"found a version made for a {got.duration:g}s recording, matching the {audio_seconds:g}s audio"
+                                                if got else f"no version made for the {audio_seconds:g}s audio, keeping the first"))
+            if got:
+                self._lyrics_done.emit(item_id, got)
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str, result=bool)
+    def hasLyricOffset(self, item_id: str):
+        return item_id in (self.lib.prefs.get("lyric_offsets") or {})
+
+    @Slot(str, float, result=float)
+    def lyricAutoOffset(self, item_id: str, audio_seconds: float):
+        """When the timings were made for a longer or shorter recording than the one playing, the lyrics are off by about the
+        difference (a cut intro is the usual cause). That difference is the starting guess, which the nudge buttons can fix."""
+        d = self._lyric_dur.get(item_id, 0.0) - audio_seconds
+        return round(d, 1) if audio_seconds > 0 and 2.0 <= abs(d) <= 30.0 else 0.0
+
+    @Slot(str, float)
+    def setLyricOffset(self, item_id: str, seconds: float):
+        offsets = dict(self.lib.prefs.get("lyric_offsets") or {})
+        if abs(seconds) < 0.05:
+            offsets.pop(item_id, None)
+        else:
+            offsets[item_id] = round(seconds, 2)
+        self.lib.prefs["lyric_offsets"] = offsets
+        self.lib.save()
 
     @Slot(str, int, result=str)
     def neighbor(self, item_id: str, delta: int):

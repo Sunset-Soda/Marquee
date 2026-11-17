@@ -43,6 +43,7 @@ class Lyrics:
     lines: list[Line] = field(default_factory=list)
     synced: bool = False
     source: str = ""          # "file", "tags", "lrclib"
+    duration: float = 0.0     # length of the recording the timings were made for, when known
 
     def as_rows(self) -> list[dict]:
         return [{"t": ln.t, "text": ln.text} for ln in self.lines]
@@ -152,7 +153,7 @@ def _pick(rows: list[dict], duration: float) -> dict | None:
         gap = abs(float(d) - duration) if d and duration else 0.0
         return (0 if gap <= 3 else 1, 0 if r.get("syncedLyrics") else 1, gap)
     best = min(usable, key=rank)
-    if duration and best.get("duration") and abs(float(best["duration"]) - duration) > 8:
+    if duration and best.get("duration") and abs(float(best["duration"]) - duration) > 4:
         return None                                  # a different recording or a different song
     return best
 
@@ -184,6 +185,9 @@ def from_lrclib(artist: str, title: str, album: str, duration: float, request: R
     got = parse(row.get("syncedLyrics") or "") or parse(row.get("plainLyrics") or "")
     if got:
         got.source = "lrclib"
+        got.duration = float(row.get("duration") or 0)
+        print(f"[lyrics] lrclib chose {row.get('artistName')!r} - {row.get('trackName')!r} ({row.get('albumName')!r}), "
+              f"{row.get('duration')}s against {duration:g}s here; first line at {got.lines[0].t:g}s", flush=True)
     return got
 
 
@@ -202,13 +206,13 @@ def _load_cached(p: Path) -> tuple[bool, Lyrics | None]:
     if not raw.get("lines"):
         return (time.time() - raw.get("at", 0) < NEGATIVE_DAYS * 86400), None
     lines = [Line(float(r["t"]), str(r["text"])) for r in raw["lines"]]
-    return True, Lyrics(lines, bool(raw.get("synced")), raw.get("source", "lrclib"))
+    return True, Lyrics(lines, bool(raw.get("synced")), raw.get("source", "lrclib"), float(raw.get("duration") or 0))
 
 
 def _store(p: Path, got: Lyrics | None) -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"at": time.time(), "synced": bool(got and got.synced), "source": got.source if got else "",
+        p.write_text(json.dumps({"at": time.time(), "synced": bool(got and got.synced), "source": got.source if got else "", "duration": got.duration if got else 0,
                                  "lines": got.as_rows() if got else []}), encoding="utf-8")
     except OSError:
         pass
@@ -234,5 +238,58 @@ def lookup(lib: Library, item: Item, online: bool = True, request: Request = htt
             return got                                   # no connection: try again next time, remember nothing
         _store(cache, net or got)
         return net if net and (not got or net.synced) else got
+    except Exception:
+        return None
+
+
+def lookup_track(artist: str, title: str, album: str = "", dur: float = 0.0, online: bool = True, request: Request = http,
+                 first: Callable[[], Lyrics | None] | None = None) -> Lyrics | None:
+    """Lyrics for a song that is not a file in the library (YouTube Music). `first` (the service's own lyrics) is tried
+    before LRCLIB. Results are cached; a failed lookup is not. Never raises."""
+    try:
+        cache = _cache_file(("ytm4|" if first else "") + artist, title, album)
+        known, cached = _load_cached(cache)
+        if known:
+            return cached
+        if not online:
+            return None
+        net = None
+        if first:
+            try:
+                net = first()
+            except Exception as e:
+                print(f"[lyrics] the service's own lyrics failed: {e}")
+        try:
+            if net is None or not net.synced:                # the service had no timing: LRCLIB's timed version is better
+                other = from_lrclib(artist, title, album, dur, request)
+                if other and (net is None or other.synced):
+                    net = other
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return None                                  # no connection: try again next time, remember nothing
+        _store(cache, net)
+        return net
+    except Exception:
+        return None
+
+
+def refine(artist: str, title: str, album: str, audio_dur: float, request: Request = http) -> Lyrics | None:
+    """Timed lyrics made for a recording about as long as the audio really being played (within a few seconds).
+    The listed length of a YouTube Music track can differ from its audio, and lyric timings only fit the recording they
+    were made for. Cached by the audio length; never raises."""
+    if not (artist and title and audio_dur > 0):
+        return None
+    try:
+        cache = _cache_file("ytm-len|" + artist, title, f"{album}|{round(audio_dur)}")
+        known, cached = _load_cached(cache)
+        if known:
+            return cached
+        try:
+            got = from_lrclib(artist, title, album, audio_dur, request)
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return None
+        if got and not (got.synced and got.duration and abs(got.duration - audio_dur) <= 4):
+            got = None                                       # only a close recording is worth switching to
+        _store(cache, got)
+        return got
     except Exception:
         return None

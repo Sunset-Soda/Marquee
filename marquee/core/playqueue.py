@@ -72,6 +72,12 @@ class PlayQueue:
         self._arrange(start)
         return self.current
 
+    def peek(self) -> str:
+        """The track Next would play, without moving to it. '' at the end, and when repeat-one keeps the same song."""
+        if not self.order or self.repeat == "one":
+            return ""
+        return self.order[self.pos + 1] if self.pos + 1 < len(self.order) else ""
+
     def _fresh_start(self, avoid: str) -> str:
         choices = [i for i in self.ids if i != avoid] or self.ids
         return self.rng.choice(choices)

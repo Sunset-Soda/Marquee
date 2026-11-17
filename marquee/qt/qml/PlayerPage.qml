@@ -21,7 +21,9 @@ Kirigami.Page {
     property var lyricRows: []
     property bool lyricSynced: false
     property string lyricStatus: ""
-    readonly property bool wideLayout: width >= Kirigami.Units.gridUnit * 50
+    property string refinedFor: ""
+    property real lyricOffset: 0                 // seconds; positive shows lyrics earlier
+    readonly property bool wideLayout: width >= Kirigami.Units.gridUnit * 36
     readonly property bool lyricsShown: !isVideo && music.lyricsOn
     property real resumeAt: 0
     property string errorText: ""
@@ -118,6 +120,8 @@ Kirigami.Page {
         resumeAt = info.pos * 1000
         videoPlayer.source = info.url
         videoPlayer.play()
+        sponsorParts = []; skipped = ({}); sponsorOn = marquee.sponsorBlockOn()
+        if (!!info.yt && !info.live) marquee.loadSponsorSegments(id)
         startVisuals()
     }
     // Show whatever the music player is on now, and start the colours, bars and lyrics for it.
@@ -127,6 +131,7 @@ Kirigami.Page {
         errorText = ""
         subTracks = []; subSel = ""; subText = ""; subNote = ""
         lyricRows = []; lyricSynced = false; lyricStatus = ""
+        lyricOffset = marquee.lyricOffset(itemId)
         startVisuals()
         if (music.lyricsOn) askLyrics()
     }
@@ -135,6 +140,22 @@ Kirigami.Page {
         lyricStatus = "Looking for lyrics…"
         marquee.loadLyrics(itemId)
     }
+    // diagnostics for lyric clicks: where we asked to go, and where the player really was a moment later
+    Timer { id: seekCheck; property real target: 0; interval: 1500
+            onTriggered: console.log("lyrics seek: asked for " + target.toFixed(1) + "s, player is at " + (pp.player.position / 1000).toFixed(1) + "s, offset " + pp.lyricOffset) }
+    // Timings made for a recording of a different length: start from the difference, unless you've set it by hand.
+    function autoLyricOffset() {
+        if (isVideo || !lyricSynced || !(player.duration > 0) || marquee.hasLyricOffset(itemId)) return
+        var o = marquee.lyricAutoOffset(itemId, player.duration / 1000)
+        if (o !== 0 && refinedFor !== itemId) {         // first look for lyrics made for a recording this long
+            refinedFor = itemId
+            marquee.refineLyrics(itemId, player.duration / 1000)
+        }
+        if (o !== 0) console.log("lyrics: timings are for a recording " + o + "s different in length, shifting by that")
+        lyricOffset = o
+    }
+    Connections { target: pp.player; function onDurationChanged() { pp.autoLyricOffset() } }
+    function nudgeLyrics(d) { lyricOffset = Math.round((lyricOffset + d) * 10) / 10; marquee.setLyricOffset(itemId, lyricOffset) }
     function toggleLyrics() { music.lyricsOn = !music.lyricsOn }
     Connections {
         target: pp.music
@@ -147,12 +168,13 @@ Kirigami.Page {
     }
     Connections {
         target: marquee
-        function onVizStyleChanged() { pp.vizStyle = marquee.vizStyle(); viz.requestPaint(); fullViz.requestPaint() }
+        function onVizStyleChanged() { pp.vizStyle = marquee.vizStyle(); viz.requestPaint(); fullViz.requestPaint(); backViz.requestPaint() }
         function onLyricsReady(id, rows, synced, source) {
             if (id !== pp.itemId) return
             pp.lyricRows = rows
             pp.lyricSynced = synced
             pp.lyricStatus = rows.length === 0 ? "No lyrics found for this song." : ""
+            pp.autoLyricOffset()
         }
     }
     function toggleMute() { if (isLive) live.muted = !live.muted; else if (isVideo) audioOut.muted = !audioOut.muted; else music.muted = !music.muted }
@@ -199,9 +221,9 @@ Kirigami.Page {
     }
     function setSize(n) { subSize = n; marquee.setSubtitleSize(n) }
 
-    Component.onCompleted: { fs = pp.Window.window ? pp.Window.window.visibility === Window.FullScreen : false; startCollection = marquee.collection; startTab = marquee.tab; subSize = marquee.subtitleSize(); vizStyle = marquee.vizStyle(); load(itemId) }
+    Component.onCompleted: { sponsorOn = marquee.sponsorBlockOn(); fs = pp.Window.window ? pp.Window.window.visibility === Window.FullScreen : false; startCollection = marquee.collection; startTab = marquee.tab; subSize = marquee.subtitleSize(); vizStyle = marquee.vizStyle(); load(itemId) }
 
-    function setViz(style) { vizStyle = style; marquee.setVizStyle(style); viz.requestPaint(); fullViz.requestPaint() }
+    function setViz(style) { vizStyle = style; marquee.setVizStyle(style); viz.requestPaint(); fullViz.requestPaint(); backViz.requestPaint() }
     // Draws the visualiser. `full` is the wide one behind the cover: it stands on a baseline 72% of the way down, is
     // drawn softer so the cover stays the focus, and is mirrored faintly below. The small one fills its box.
     function paintViz(cv, full) {
@@ -273,14 +295,21 @@ Kirigami.Page {
             if (pp.vizStyle === "scope") pp.waveData = marquee.waveAt(player.position / 1000)
             viz.requestPaint()
             fullViz.requestPaint()
+            backViz.requestPaint()
         }
     }
 
     property string subBadge: ""
+    // SponsorBlock: parts of a YouTube video to jump over. `skipped` remembers which ones were already skipped, so
+    // seeking back into one (to watch it on purpose) isn't undone.
+    property var sponsorParts: []
+    property var skipped: ({})
+    property bool sponsorOn: true
     Timer { id: subBadgeTimer; interval: 4500; onTriggered: pp.subBadge = "" }
     Connections {
         target: marquee
         function onSubToast(text) { pp.subBadge = text; subBadgeTimer.restart() }
+        function onSponsorReady(id, parts) { if (id === pp.itemId) { pp.sponsorParts = parts; pp.skipped = ({}) } }
         function onSubtitleTimingChanged(id, delay) { if (id === pp.itemId) pp.subDelay = delay }
         function onSubtitleTracksReady(id, tracks, sel, note) {
             if (id !== pp.itemId) return
@@ -288,6 +317,23 @@ Kirigami.Page {
             pp.subSel = sel
             pp.subNote = note
             if (sel !== "") pp.subLast = sel
+        }
+    }
+    Timer {
+        interval: 250
+        repeat: true
+        running: pp.isVideo && pp.sponsorOn && pp.sponsorParts.length > 0
+        onTriggered: {
+            var t = videoPlayer.position / 1000
+            for (var i = 0; i < pp.sponsorParts.length; i++) {
+                var p = pp.sponsorParts[i]
+                if (t >= p[0] && t < p[1] - 0.3 && !pp.skipped[i]) {
+                    pp.skipped[i] = true
+                    videoPlayer.position = p[1] * 1000
+                    pp.subBadge = "Skipped: " + p[2]; subBadgeTimer.restart()
+                    break
+                }
+            }
         }
     }
     Timer {
@@ -374,6 +420,8 @@ Kirigami.Page {
     Shortcut { sequences: ["C"]; onActivated: pp.toggleSubtitles() }
     Shortcut { sequences: ["M"]; onActivated: pp.toggleMute() }
     Shortcut { sequences: ["L"]; enabled: !pp.isVideo; onActivated: pp.toggleLyrics() }
+    Shortcut { sequences: ["["]; enabled: pp.lyricsShown && pp.lyricSynced; onActivated: pp.nudgeLyrics(-0.1) }   // fine adjustment: 0.1s
+    Shortcut { sequences: ["]"]; enabled: pp.lyricsShown && pp.lyricSynced; onActivated: pp.nudgeLyrics(0.1) }
     Shortcut { sequences: ["N"]; onActivated: pp.step(1) }
     Shortcut { sequences: ["P"]; onActivated: pp.step(-1) }
     Shortcut { sequences: ["F", "F11"]; onActivated: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
@@ -606,6 +654,17 @@ Kirigami.Page {
                 }
             }
         }
+        // A narrow window shows only the lyrics, so the visualiser moves behind them: soft bars standing on the bottom edge.
+        Canvas {
+            id: backViz
+            z: 0
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+            height: parent.height * 0.3
+            opacity: 0.18                       // faint, so the lyrics stay easy to read over it
+            visible: pp.lyricsShown && !pp.wideLayout && pp.vizStyle !== "off"
+            renderTarget: Canvas.FramebufferObject
+            onPaint: pp.paintViz(backViz, true)
+        }
         LyricsView {
             anchors {
                 right: parent.right; top: parent.top; bottom: parent.bottom
@@ -616,8 +675,8 @@ Kirigami.Page {
             rows: pp.lyricRows
             synced: pp.lyricSynced
             status: pp.lyricStatus
-            pos: pp.player.position / 1000
-            onSeekTo: seconds => pp.player.position = seconds * 1000
+            pos: pp.player.position / 1000 + pp.lyricOffset
+            onSeekTo: seconds => { pp.player.position = (seconds - pp.lyricOffset) * 1000; seekCheck.target = seconds - pp.lyricOffset; seekCheck.restart() }
         }
 
         Kirigami.InlineMessage {
@@ -709,6 +768,25 @@ Kirigami.Page {
                     text: "Lyrics"; checkable: true; checked: pp.lyricsShown
                     onClicked: pp.toggleLyrics()
                     QQC2.ToolTip.text: "Lyrics (L)"; QQC2.ToolTip.visible: hovered
+                }
+                RowLayout {
+                    visible: pp.lyricsShown && pp.lyricSynced
+                    spacing: 0
+                    QQC2.ToolButton {
+                        icon.name: "go-previous"; display: QQC2.AbstractButton.IconOnly; text: "Lyrics later"
+                        onClicked: pp.nudgeLyrics(-0.5)
+                        QQC2.ToolTip.text: "Lyrics come too early: show them later (the [ key does it in smaller steps)"; QQC2.ToolTip.visible: hovered
+                    }
+                    QQC2.Label {
+                        text: pp.lyricOffset === 0 ? "Sync" : (pp.lyricOffset > 0 ? "+" : "") + pp.lyricOffset.toFixed(1) + "s"
+                        opacity: 0.8
+                        MouseArea { anchors.fill: parent; onDoubleClicked: { pp.lyricOffset = 0; marquee.setLyricOffset(pp.itemId, 0) } }
+                    }
+                    QQC2.ToolButton {
+                        icon.name: "go-next"; display: QQC2.AbstractButton.IconOnly; text: "Lyrics earlier"
+                        onClicked: pp.nudgeLyrics(0.5)
+                        QQC2.ToolTip.text: "Lyrics come too late: show them earlier (the ] key does it in smaller steps; double-click the number to reset)"; QQC2.ToolTip.visible: hovered
+                    }
                 }
                 Item { Layout.fillWidth: true }
                 QQC2.ToolButton {

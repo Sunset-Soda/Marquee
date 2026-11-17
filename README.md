@@ -16,9 +16,11 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 - **Library:** Movies, TV Shows, Music, Podcasts, Home Videos and Audiobooks, with cover art looked up online.
 - **YouTube without an account:** search, channels, playlists, subscriptions (Google Takeout import), history,
   quality menu with Auto, resume where you left off, fast start.
+- **YouTube Music:** search songs, albums, artists and playlists with no account. Album and artist pages look like the Music tab, and songs play in the same mini player with lyrics and media keys. Needs the `requests` Python package.
 - **Live TV:** M3U playlists with an XMLTV guide.
 - **Music:** artist pages, lyrics, visualiser, background mini player.
-- **Subtitles:** automatic sync and download.
+- **Subtitles:** automatic sync and download from OpenSubtitles, with Subdl as an optional backup.
+- **SponsorBlock:** skips sponsor reads and similar parts of YouTube videos, and you choose which kinds.
 
 ## Download
 
@@ -37,6 +39,17 @@ Python 3.10+ and Qt 6 with Kirigami.
 | Debian / Ubuntu | `python3-pyside6.qtquick python3-pyside6.qtmultimedia qml6-module-org-kde-kirigami qml6-module-qtquick-dialogs` (names vary) |
 
 For YouTube also install `yt-dlp`, `deno`, `yt-dlp-ejs` and `ffmpeg` (`curl_cffi` is optional).
+
+**New for YouTube Music:** it also needs the Python `requests` package. Most systems already have it; if YouTube Music
+says it is missing, install it from your distro (the AppImage uses your system's Python, so this applies to it too):
+
+| Distro | Package |
+|---|---|
+| Arch | `sudo pacman -S python-requests` |
+| Fedora | `sudo dnf install python3-requests` |
+| Debian / Ubuntu | `sudo apt install python3-requests` |
+
+Nothing else is new to install. The catalogue library for YouTube Music (ytmusicapi) is bundled in the app.
 Run with `python3 -m marquee`, or `pip install .[qt]`. `bash install-desktop.sh` adds the app icon to the Linux taskbar.
 
 ## Library features
@@ -136,6 +149,11 @@ video has no subtitles, Marquee then looks one up automatically, once per video,
 of the file first, then the show, season and episode or the movie title and year. **CC › Download Subtitles** does
 it on demand. Your key and login are stored in `~/.local/share/marquee/opensubtitles.json`, readable only by you.
 
+**Backup source (Subdl).** Optionally add a free API key from [subdl.com](https://subdl.com) in the same dialog. Marquee asks
+OpenSubtitles first and tries Subdl when it finds nothing for that episode or movie, or can't be used (for example, the
+daily download limit was reached). Shows are searched by their IMDb number, so a remake with the same name is never
+confused with the original. The key is stored in the same private file.
+
 Formats: `.srt`, `.vtt`, `.ass` and `.ssa` (shown as plain text, without ASS styling). Picture-based tracks (PGS,
 VobSub) cannot be shown; the CC menu says so. English is chosen first when several are available, and your
 choice, timing offset and text size are remembered. Timing moves subtitles in 0.5 s steps.
@@ -168,6 +186,25 @@ needs **deno** and **yt-dlp-ejs** installed.
 **Recommended tab (optional):** in Settings › YouTube pick the browser you are signed in to YouTube with. Marquee
 then reads that browser's login through yt-dlp to fetch your home-page recommendations. This hands Marquee your
 YouTube session and YouTube may flag automated use, so it is off by default.
+
+### SponsorBlock
+
+YouTube videos skip the parts the [SponsorBlock](https://sponsor.ajay.app) community has marked, and the corner of the player
+says what was skipped. In **Settings › SponsorBlock** turn it on or off and choose which kinds to skip: sponsors,
+self-promotion and like-and-subscribe reminders (the default), plus intros, outros, previews and recaps, filler, and the
+non-music parts of music videos. Only a short code made from a hash of the video's ID is sent to look the parts up.
+If you seek back into a skipped part, it is not skipped a second time. SponsorBlock data is licensed
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) and belongs to its contributors.
+
+## YouTube Music (Qt frontend)
+
+Choose **YouTube Music** in the sidebar. Search songs, albums, artists and playlists with no account; album and artist
+pages look like the Music tab, and songs play in the mini player with the visualiser, lyrics and media keys. Lyrics come
+from YouTube Music itself when it has them, otherwise from LRCLIB, matched to the length of the audio so the timing
+fits; if a song is still early or late, **[** and **]** nudge the lyrics by 0.1 s and the arrows by the Lyrics button by
+0.5 s, remembered for that song. The next song is looked up while the current one plays, so it starts quickly.
+
+It uses the same `yt-dlp` setup as YouTube, plus the `requests` package (see Install).
 
 ## Live TV (Qt frontend)
 
@@ -214,6 +251,15 @@ sh packaging/build-appimage.sh --appdir   # or just build packaging/build/Marque
 
 The AppImage does not bundle Python or Qt. It runs on your system's own so that it follows your desktop theme.
 Install the packages from the Install section first.
+
+## Credits
+
+Episode names and TV artwork: [TVmaze](https://www.tvmaze.com) (CC BY-SA 4.0). Lyrics: [LRCLIB](https://lrclib.net) and
+YouTube Music. Subtitles: [OpenSubtitles](https://www.opensubtitles.com) and [Subdl](https://subdl.com). Skip data:
+[SponsorBlock](https://sponsor.ajay.app) (CC BY-NC-SA 4.0). YouTube Music catalogue access:
+[ytmusicapi](https://github.com/sigma67/ytmusicapi) by sigma67 (MIT; a copy is bundled in `marquee/_vendor` with its
+licence). Marquee is not affiliated with or endorsed by YouTube, Google or any of these services, and they can change
+or stop working without notice.
 
 ## Notes
 

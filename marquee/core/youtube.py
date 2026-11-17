@@ -38,6 +38,8 @@ CLIENTS = ["", "android_vr", "tv", "mweb", "ios", "web_safari"]
 # Sorted by "res" (the shorter side of the picture), so a vertical video's 480 means 480 wide, not 480 tall.
 DASH_FORMAT = "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba/b"
 DASH_SORT = "res:480,vcodec:h264,acodec:aac"
+# Sound only, for YouTube Music. m4a (AAC) first because every Qt audio backend plays it; Opus otherwise.
+AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 
 
 QUALITIES = ["auto", "1080", "720", "480", "360"]
@@ -617,6 +619,91 @@ class YtDlp:
                 return self.fetch_dash(video_id, meta, max(want, 480))
         raise RuntimeError("YouTube won’t let Marquee stream this particular video (every address was refused, HTTP 403). "
                            "Other videos should still play. " + (self.diagnose(video_id) or "").strip())
+
+    _audio_good = ""        # the player client that last gave a working audio address
+
+    # ---- audio only, for YouTube Music --------------------------------------------------------------------
+    def _attempt_audio(self, video_id: str, client: str, with_login: bool) -> dict:
+        self._client = client + ("+login" if with_login else "")
+        extra = ["--force-ipv4", *js_runtime_args()] + (["--extractor-args", f"youtube:player_client={client}"] if client else [])
+        d = self._json("--dump-single-json", "--no-playlist", "-f", AUDIO_FORMAT, *extra,
+                       f"https://music.youtube.com/watch?v={video_id}", cookies=with_login)
+        url = d.get("url") or ""
+        if not url:
+            fmts = [f for f in (d.get("formats") or []) if f.get("url") and f.get("acodec") not in (None, "none")]
+            fmts.sort(key=lambda f: (f.get("vcodec") in (None, "none"), f.get("abr") or 0))
+            url = fmts[-1]["url"] if fmts else ""
+        print(f"[youtube] {video_id}: audio client={self._client or 'default'} format={d.get('format_id')} {d.get('ext')} "
+              f"{d.get('abr')}kbps host={url.split('/')[2] if '//' in url else ''}", file=sys.stderr, flush=True)
+        if not url:
+            raise RuntimeError(d.get("reason") or "YouTube gave no audio stream for this track.")
+        return {"id": video_id, "title": d.get("track") or d.get("title") or "", "channel": d.get("artist") or d.get("channel") or "",
+                "url": url, "headers": d.get("http_headers") or {}, "dur": float(d.get("duration") or 0),
+                "thumb": d.get("thumbnail") or "", "live": False, "size_hint": int(d.get("filesize") or d.get("filesize_approx") or 0),
+                "audio": True}
+
+    def resolve_audio(self, video_id: str, probe: Callable[[dict], bool] | None = None) -> dict:
+        """The audio stream of one track: {id, url, headers, dur, ...}, or {file: ...} when yt-dlp had to download it.
+
+        Each way of asking YouTube is tried in turn and every address is test-fetched first, exactly as resolve() does
+        for video, because some clients are handed addresses that answer 403.
+        """
+        probe = probe or probe_stream
+        last: Exception | None = None
+        waited = False
+        order = sorted(CLIENTS, key=lambda c: c != self._audio_good)        # what worked last time goes first
+        for with_login in ([False, True] if self.browser else [False]):
+            for client in order:
+                try:
+                    info = self._attempt_audio(video_id, client, with_login)
+                except Exception as e:
+                    last = e
+                    if with_login and "cookie" in str(e).lower():
+                        break
+                    continue
+                if probe(info):
+                    self._audio_good = client
+                    return info
+                if not waited and self.retry_wait > 0:
+                    waited = True
+                    print(f"[youtube] {video_id}: audio address refused; waiting {self.retry_wait:g}s and trying once more",
+                          file=sys.stderr, flush=True)
+                    time.sleep(self.retry_wait)
+                    if probe(info):
+                        self._audio_good = client
+                        return info
+                print(f"[youtube] {video_id}: audio client={self._client or 'default'} address refused", file=sys.stderr, flush=True)
+        print(f"[youtube] {video_id}: asking yt-dlp to download the audio instead", file=sys.stderr, flush=True)
+        try:
+            return self.fetch_audio(video_id)
+        except RuntimeError as e:
+            raise RuntimeError(_hint(str(last or "")) or str(e)) from e
+
+    def fetch_audio(self, video_id: str) -> dict:
+        """Let yt-dlp save the audio (a few MB) into the cache, and hand back the file."""
+        folder = cache_dir() / "ytmusic"
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in sorted(folder.glob("*"), key=lambda f: f.stat().st_mtime, reverse=True)[20:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        done = [f for f in folder.glob(f"{video_id}.*") if f.suffix not in (".part", ".ytdl") and f.stat().st_size > 50_000]
+        if done:
+            return {"id": video_id, "title": "", "channel": "", "file": str(done[0]), "size": done[0].stat().st_size, "headers": {},
+                    "dur": 0.0, "thumb": "", "live": False, "audio": True}
+        cmd = [self.exe, "--no-playlist", "--force-ipv4", "-q", "--no-warnings", *js_runtime_args(),
+               "-f", AUDIO_FORMAT, "-o", str(folder / "%(id)s.%(ext)s"), f"https://music.youtube.com/watch?v={video_id}"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"Couldn’t run yt-dlp: {e}")
+        files = [f for f in folder.glob(f"{video_id}.*") if f.suffix not in (".part", ".ytdl")]
+        if p.returncode != 0 or not files:
+            print(p.stderr, file=sys.stderr, flush=True)
+            raise RuntimeError(_hint(p.stderr) or "yt-dlp could not fetch this track's audio either.")
+        return {"id": video_id, "title": "", "channel": "", "file": str(files[0]), "size": files[0].stat().st_size, "headers": {},
+                "dur": 0.0, "thumb": "", "live": False, "audio": True}
 
     def fetch_to_cache(self, video_id: str, meta: dict) -> dict:
         """Start yt-dlp saving the video into the cache; return once enough has arrived to start playing it."""

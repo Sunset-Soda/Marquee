@@ -25,6 +25,7 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
         return 1
     from .controller import Controller
     from .youtube_ctl import YoutubeController
+    from .ytmusic_ctl import YtMusicController
 
     # QApplication (not QGuiApplication) so Kirigami can load qqc2-desktop-style, which draws native Breeze
     # controls on Plasma. Qt 6 scales per monitor and fractionally by default; nothing to configure for high DPI.
@@ -58,6 +59,8 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
     youtube = YoutubeController(controller)
     engine.rootContext().setContextProperty("marquee", controller)
     engine.rootContext().setContextProperty("youtube", youtube)
+    ytmusic = YtMusicController(controller, youtube)
+    engine.rootContext().setContextProperty("ytmusic", ytmusic)
     engine.rootContext().setContextProperty("desktopName", dt.label)
     engine.load(QUrl.fromLocalFile(str(Path(__file__).parent / "qml" / "Main.qml")))
     if not engine.rootObjects():

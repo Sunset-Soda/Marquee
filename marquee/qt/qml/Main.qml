@@ -83,7 +83,8 @@ Kirigami.ApplicationWindow {
     // Live TV replaces the library page in place (depth stays 1), so the player still sits one level above either.
     property bool liveActive: false
     property bool youtubeActive: false
-    readonly property bool inLibrary: !liveActive && !youtubeActive
+    property bool ytmusicActive: false
+    readonly property bool inLibrary: !liveActive && !youtubeActive && !ytmusicActive
     // The channel playing in the small preview box on the Live TV page ("" = none). Set when you leave a live
     // channel with Back or Guide, so it carries on while you look for another.
     property string pipId: ""
@@ -93,6 +94,7 @@ Kirigami.ApplicationWindow {
         pageStack.replace(Qt.resolvedUrl("LivePage.qml"), { music: musicEngine })
         liveActive = true
         youtubeActive = false
+        ytmusicActive = false
     }
     function showYoutube() {
         pipId = ""
@@ -102,6 +104,24 @@ Kirigami.ApplicationWindow {
         pageStack.replace(Qt.resolvedUrl("YoutubePage.qml"), { music: musicEngine })
         youtubeActive = true
         liveActive = false
+        ytmusicActive = false
+    }
+    function showYtMusic() {
+        pipId = ""
+        liveEngine.stop()
+        leavePlayer()
+        if (ytmusicActive) return
+        pageStack.replace(Qt.resolvedUrl("YtMusicPage.qml"), { music: musicEngine })
+        ytmusicActive = true
+        youtubeActive = false
+        liveActive = false
+    }
+    // Play a list of YouTube Music tracks from one of them. They are not library files, so the queue is built here.
+    function playYtm(tracks, index) {
+        pipId = ""
+        liveEngine.stop()
+        var id = ytmusic.setQueue(tracks, index)
+        if (id !== "") musicEngine.play(id)
     }
     function showLibrary() {
         pipId = ""
@@ -111,6 +131,7 @@ Kirigami.ApplicationWindow {
         pageStack.replace(Qt.resolvedUrl("LibraryPage.qml"), { music: musicEngine })
         liveActive = false
         youtubeActive = false
+        ytmusicActive = false
     }
     function playLive(channelId) {
         pipId = ""
@@ -222,6 +243,25 @@ Kirigami.ApplicationWindow {
                 QQC2.Label { text: "YouTube"; Layout.fillWidth: true; elide: Text.ElideRight }
             }
         }
+        QQC2.ItemDelegate {
+            Layout.fillWidth: true
+            highlighted: root.ytmusicActive
+            onClicked: {
+                root.showYtMusic()
+                if (drawer.modal) drawer.close()
+            }
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+                Kirigami.Icon {
+                    source: Qt.resolvedUrl("ytmusic.svg")
+                    isMask: true
+                    color: Kirigami.Theme.textColor
+                    implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                    implicitHeight: Kirigami.Units.iconSizes.smallMedium
+                }
+                QQC2.Label { text: "YouTube Music"; Layout.fillWidth: true; elide: Text.ElideRight }
+            }
+        }
         Item { Layout.fillHeight: true }
     }
 
@@ -284,6 +324,8 @@ Kirigami.ApplicationWindow {
             translucentBox.checked = marquee.translucent
             liveAutoBox.checked = marquee.liveAutoplay()
             syncBox.checked = marquee.autoSyncSubtitles()
+            sponsorMaster.checked = marquee.sponsorBlockOn()
+            sponsorList.model = marquee.sponsorCategories()
             var bs = youtube.browsers
             ytFastBox.checked = youtube.fastStart
             ytCacheBox.currentIndex = Math.max(0, ytCacheBox.keys.indexOf(youtube.cacheMode))
@@ -355,6 +397,31 @@ Kirigami.ApplicationWindow {
                     text: "Start quickly at 360p, then switch to the chosen quality"
                     onToggled: youtube.setFastStart(checked)
                 }
+                Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "SponsorBlock" }
+                QQC2.CheckBox {
+                    id: sponsorMaster
+                    text: "Skip marked parts of YouTube videos"
+                    onToggled: marquee.setSponsorBlock(checked)
+                }
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.7
+                    font: Kirigami.Theme.smallFont
+                    text: "Parts are marked by the SponsorBlock community. Only a short code made from the video's ID is sent to look them up. Pick what to skip:"
+                }
+                ColumnLayout {
+                    enabled: sponsorMaster.checked
+                    Repeater {
+                        id: sponsorList
+                        delegate: QQC2.CheckBox {
+                            required property var modelData
+                            text: modelData[1]
+                            checked: modelData[2]
+                            onToggled: marquee.setSponsorCategory(modelData[0], checked)
+                        }
+                    }
+                }
                 Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Subtitles" }
                 QQC2.CheckBox {
                     id: syncBox
@@ -378,20 +445,21 @@ Kirigami.ApplicationWindow {
         onAboutToShow: {
             var c = marquee.subtitleSettings()
             keyField.text = c.apiKey; userField.text = c.username; passField.text = c.password
-            langField.text = c.language; autoBox.checked = c.auto
+            langField.text = c.language; autoBox.checked = c.auto; subdlField.text = c.subdlKey
         }
-        onAccepted: marquee.saveSubtitleSettings(keyField.text, userField.text, passField.text, langField.text, autoBox.checked)
+        onAccepted: marquee.saveSubtitleSettings(keyField.text, userField.text, passField.text, langField.text, autoBox.checked, subdlField.text)
         ColumnLayout {
             spacing: Kirigami.Units.largeSpacing
             QQC2.Label {
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 24
                 wrapMode: Text.Wrap
-                text: "Marquee downloads subtitles from OpenSubtitles.com. Make a free account there, then create an API key under Profile › API consumers, and enter them below. They are saved only on this computer."
+                text: "Marquee downloads subtitles from OpenSubtitles.com. Make a free account there, then create an API key under Profile › API consumers, and enter them below. If OpenSubtitles has nothing, or its daily limit is reached, Marquee can try Subdl as a backup: make a free account at subdl.com and paste its API key in the last box. Keys are saved only on this computer."
             }
             Kirigami.FormLayout {
                 QQC2.TextField { id: keyField; Kirigami.FormData.label: "API key:"; Layout.minimumWidth: Kirigami.Units.gridUnit * 16 }
                 QQC2.TextField { id: userField; Kirigami.FormData.label: "Username:" }
                 QQC2.TextField { id: passField; Kirigami.FormData.label: "Password:"; echoMode: TextInput.Password }
+                QQC2.TextField { id: subdlField; Kirigami.FormData.label: "Subdl API key (backup):"; placeholderText: "optional" }
                 QQC2.TextField { id: langField; Kirigami.FormData.label: "Language code:"; placeholderText: "en" }
                 QQC2.CheckBox { id: autoBox; text: "Download automatically when a video has none" }
             }

@@ -21,7 +21,43 @@ Item {
     readonly property bool playing: mp.playbackState === MediaPlayer.PlayingState
     signal trackChanged()
 
+    // YouTube Music tracks have no file: the stream address is looked up first (a few seconds), then it plays.
+    property bool loading: false
+    function playYtm(id) {
+        itemId = id
+        errorText = ""
+        loading = true
+        mp.stop(); mp.source = ""
+        marquee.stopVisualizer()
+        ytmusic.play(id)                                 // looks the stream up, and fills in the title and cover at once
+        info = ytmusic.infoFor(id)
+        try { var p = marquee.paletteFor(id); if (p && p.base) pal = p } catch (e) { console.warn("palette:", e) }
+        marquee.noteTrack(id)
+        trackChanged()
+    }
+    Connections {
+        target: ytmusic
+        function onReady(id) {
+            if (id !== eng.itemId) return
+            eng.info = ytmusic.infoFor(id)
+            eng.loading = false
+            mp.source = eng.info.url
+            mp.play()
+            try { marquee.startVisualizer(id) } catch (e) { console.warn("visualiser:", e) }
+        }
+        function onPaletteReady(id) {
+            if (id !== eng.itemId) return
+            try { var p = marquee.paletteFor(id); if (p && p.base) eng.pal = p } catch (e) { console.warn("palette:", e) }
+        }
+        function onFailed(id, message) {
+            if (id !== eng.itemId) return
+            eng.loading = false
+            eng.errorText = "Couldn’t play “" + (eng.info.title || "this song") + "”. " + message
+        }
+    }
     function play(id) {
+        if (id.indexOf("ytm:") === 0) { playYtm(id); return }
+        loading = false
         var i = marquee.itemInfo(id)
         itemId = id
         info = i
@@ -51,6 +87,7 @@ Item {
     }
     function toggle() { playing ? mp.pause() : mp.play() }
     function stop() {
+        loading = false
         mp.stop()
         mp.source = ""
         itemId = ""

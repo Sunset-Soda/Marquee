@@ -2,13 +2,14 @@ import os
 import struct
 import sys
 import tempfile
+import urllib.error
 import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from marquee.core import artwork, desktop, iptv, youtube, library, lyrics, opensubs, palette, parse, playqueue, samples, spectrum, subsync, subtitles, tv  # noqa: E402
+from marquee.core import artwork, desktop, iptv, youtube, ytmusic, library, lyrics, opensubs, palette, parse, playqueue, samples, spectrum, sponsorblock, subsync, subtitles, tv  # noqa: E402
 import json  # noqa: E402
 
 
@@ -292,6 +293,83 @@ class ShowTests(unittest.TestCase):
         last_of_s1 = lib.browse(path=("show:ted", "season:ted:1"))[-1]
         q = lib.queue_for(last_of_s1, [])
         self.assertEqual([lib.by_id(i).title for i in q], ["Pilot", "Second Wind", "Three's Company", "Return"])
+
+    def test_original_and_reboot_with_the_same_name(self):
+        """Two shows called Ted: the right one is the one that has the user's episodes, even if the other scores higher."""
+        class TwoTeds(FakeTvmaze):
+            def __call__(self, url):
+                if "/search/shows" in url:
+                    return json.dumps([
+                        {"score": 0.99, "show": {"id": 9, "name": "Ted", "premiered": "2026-01-01", "image": None}},
+                        {"score": 0.80, "show": {"id": 1, "name": "Ted", "premiered": "2024-01-11", "image": None}}]).encode()
+                if url.endswith("/shows/9/episodes"):
+                    return json.dumps([{"season": 1, "number": 1, "name": "New Pilot", "airdate": "2026-01-01"}]).encode()
+                if url.endswith("/shows/9/seasons"):
+                    return b"[]"
+                if url.endswith("/shows/1/seasons"):
+                    return b"[]"
+                return super().__call__(url)
+        lib = self.lib()
+        status, text, renamed = tv.scrub(lib, "ted", fetch=TwoTeds())
+        self.assertEqual((status, text, renamed), ("ok", "Ted (2024)", 4))
+        self.assertEqual(lib.shows["ted"].tvmaze_id, 1)
+
+    def test_a_wrong_stored_match_is_corrected_on_refresh(self):
+        class TwoTeds(FakeTvmaze):
+            def __call__(self, url):
+                if "/search/shows" in url:
+                    return json.dumps([
+                        {"score": 0.99, "show": {"id": 9, "name": "Ted", "premiered": "2026-01-01", "image": None}},
+                        {"score": 0.80, "show": {"id": 1, "name": "Ted", "premiered": "2024-01-11", "image": None}}]).encode()
+                if url.endswith("/shows/9"):
+                    return json.dumps({"id": 9, "name": "Ted", "premiered": "2026-01-01", "image": None}).encode()
+                if url.endswith("/shows/9/episodes"):
+                    return json.dumps([{"season": 1, "number": 1, "name": "New Pilot", "airdate": "2026-01-01"}]).encode()
+                if url.endswith("/seasons"):
+                    return b"[]"
+                return super().__call__(url)
+        lib = self.lib()
+        wrong = lib.ensure_show("ted", "Ted", 0)
+        wrong.tvmaze_id, wrong.imdb = 9, "40197357"                  # an earlier, wrong match, with its IMDb number cached
+        status, text, renamed = tv.scrub(lib, "ted", force=True, fetch=TwoTeds())
+        self.assertEqual((status, lib.shows["ted"].tvmaze_id, renamed), ("ok", 1, 4))
+        self.assertEqual(lib.shows["ted"].imdb, "")                   # the old match's IMDb number is not kept
+
+    def test_compact_episode_numbers_in_a_season_folder(self):
+        """Scrubs/Season 1/103 - Title.avi is episode 3, not episode 103; a folder that is not numbered that way is left alone."""
+        s1 = self.media / "Scrubs" / "Season 1"
+        s1.mkdir(parents=True)
+        for n in ("101 - My First Day", "102 - My Mentor", "103 - My Best Friends Mistake"):
+            (s1 / f"{n}.avi").write_bytes(b"x")
+        i = parse.parse_path(s1 / "103 - My Best Friends Mistake.avi")
+        self.assertEqual((i["season"], i["episode"], i["title"]), (1, 3, "My Best Friends Mistake"))
+        daily = self.media / "Daily" / "Season 1"
+        daily.mkdir(parents=True)
+        for n in ("01 - A", "105 - B"):
+            (daily / f"{n}.mkv").write_bytes(b"x")
+        self.assertEqual(parse.parse_path(daily / "105 - B.mkv")["episode"], 105)
+        s2 = self.media / "Scrubs" / "Season 2"
+        s2.mkdir(parents=True)
+        (s2 / "201 - My Overkill.avi").write_bytes(b"x")
+        self.assertEqual(parse.parse_path(s2 / "201 - My Overkill.avi")["episode"], 1)
+
+    def test_old_libraries_get_compact_episode_numbers_fixed_once(self):
+        s1 = self.media / "Scrubs" / "Season 1"
+        s1.mkdir(parents=True)
+        for n in ("101 - My First Day", "103 - My Best Friends Mistake"):
+            (s1 / f"{n}.avi").write_bytes(b"x")
+        lib = self.lib()
+        eps = sorted((i.episode for i in lib.items if i.show_key == "scrubs"))
+        self.assertEqual(eps, [1, 3])
+        for i in lib.items:
+            if i.show_key == "scrubs":                                   # as an older version had stored them
+                i.episode += 100 * (i.season or 1) if i.episode < 100 else 0
+                i.sub_tried = True
+        lib.prefs.pop("ep_compact_v1", None)
+        self.assertEqual(lib.repair_episode_numbers(), 2)
+        self.assertEqual(sorted(i.episode for i in lib.items if i.show_key == "scrubs"), [1, 3])
+        self.assertFalse(any(i.sub_tried for i in lib.items if i.show_key == "scrubs"))
+        self.assertEqual(lib.repair_episode_numbers(), 0)                # only once
 
     def test_best_match_is_careful(self):
         results = json.loads(FakeTvmaze()("/search/shows"))
@@ -666,6 +744,89 @@ class OpenSubtitlesTests(unittest.TestCase):
             self.assertIn("query=Ted+S01E02", urls[1])
             self.assertIn("season_number=1", urls[1])
             self.assertIn("episode_number=2", urls[1])
+
+    def _subdl_request(self, calls, zipped=True, subs=None):
+        import io, zipfile
+        srt = "1\n00:00:01,000 --> 00:00:02,000\nFrom Subdl\n"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("Ted.S01E02.srt", srt)
+        listing = {"status": True, "subtitles": subs if subs is not None else [
+            {"release_name": "Ted.S01E02.1080p", "url": "/subtitle/1-2.zip", "season": 1, "episode": 2, "hi": False},
+            {"release_name": "Ted.S01E03.1080p", "url": "/subtitle/9-9.zip", "season": 1, "episode": 3},
+            {"release_name": "Ted.S01.Complete", "url": "/subtitle/5-5.zip", "full_season": True}]}
+
+        def request(method, url, body=None, headers=None, timeout=0):
+            calls.append(url)
+            if "api.subdl.com" in url:
+                return json.dumps(listing).encode()
+            if "dl.subdl.com" in url:
+                return buf.getvalue()
+            raise urllib.error.HTTPError(url, 404, "n", {}, None)      # OpenSubtitles (and anything else): nothing
+        return request
+
+    def test_subdl_is_the_backup_when_opensubtitles_has_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self._env(d)
+            lib, it = self._video(d)
+            calls = []
+            os_fake = self.fake([], results=[])
+            sd = self._subdl_request(calls)
+
+            def request(method, url, body=None, headers=None, timeout=0):
+                return sd(method, url, body, headers) if "subdl.com" in url else os_fake(method, url, body, headers)
+            creds = opensubs.Credentials(api_key="KEY", subdl_key="SDKEY", language="en")
+            status, msg, path = opensubs.fetch_for_item(lib, it, creds, request)
+            self.assertEqual((status, msg), ("ok", "Downloaded English subtitles from Subdl"))
+            self.assertIn("From Subdl", Path(path).read_text())
+            self.assertTrue(any("dl.subdl.com/subtitle/1-2.zip" in c for c in calls))       # the right episode, not E03 or the pack
+            self.assertFalse(any("9-9" in c or "5-5" in c for c in calls))
+            q = next(c for c in calls if "api.subdl.com" in c)
+            self.assertIn("api_key=SDKEY", q)
+            self.assertIn("season_number=1", q)
+            self.assertIn("episode_number=2", q)
+
+    def test_subdl_takes_over_when_opensubtitles_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self._env(d)
+            lib, it = self._video(d)
+            sd = self._subdl_request([])
+
+            def request(method, url, body=None, headers=None, timeout=0):
+                if "subdl.com" in url:
+                    return sd(method, url, body, headers)
+                raise urllib.error.HTTPError(url, 406, "limit", {}, None)           # today's allowance used up
+            creds = opensubs.Credentials(api_key="KEY", subdl_key="SDKEY", language="en")
+            self.assertEqual(opensubs.fetch_for_item(lib, it, creds, request)[0], "ok")
+            self.assertEqual(opensubs.fetch_for_item(lib, it, opensubs.Credentials(api_key="KEY"), request)[0], "error")   # no backup: say so
+
+    def test_subdl_alone_is_enough_and_wrong_episodes_are_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self._env(d)
+            lib, it = self._video(d)
+            only_wrong = [{"release_name": "Ted.S01E03", "url": "/subtitle/9-9.zip", "season": 1, "episode": 3}]
+            creds = opensubs.Credentials(subdl_key="SDKEY", language="en")
+            self.assertTrue(creds.ready)
+            self.assertEqual(opensubs.fetch_for_item(lib, it, creds, self._subdl_request([], subs=only_wrong))[0], "none")
+
+    def test_a_stale_imdb_number_is_looked_up_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            self._env(d)
+            lib, it = self._video(d)
+            info = lib.ensure_show(it.show_key, "Ted", 0)
+            info.tvmaze_id, info.imdb, info.imdb_of = 1, "40197357", 0       # cached before matches were tracked
+            asked = []
+
+            def request(method, url, body=None, headers=None, timeout=0):
+                asked.append(url)
+                return b'{"externals": {"imdb": "tt0285403"}}'
+            self.assertEqual(opensubs.imdb_id(lib, it, request), "0285403")
+            self.assertEqual(opensubs.imdb_id(lib, it, request), "0285403")
+            self.assertEqual(len(asked), 1)                                    # and then it is remembered
 
     def test_no_key_and_http_errors(self):
         import urllib.error
@@ -1627,6 +1788,263 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(wav[8:12], b"WAVE")
         self.assertEqual(len(wav), 44 + samples.RATE * samples.SECONDS * 2)
         self.assertEqual(struct.unpack("<I", wav[4:8])[0], len(wav) - 8)
+
+
+class YtMusicTests(unittest.TestCase):
+    THUMBS = [{"url": "https://lh3.googleusercontent.com/abc=w60-h60-l90-rj", "width": 60, "height": 60},
+              {"url": "https://lh3.googleusercontent.com/abc=w226-h226-l90-rj", "width": 226, "height": 226}]
+    ALBUM = {"title": "Revival", "type": "Album", "thumbnails": THUMBS, "year": "2017", "duration_seconds": 600,
+             "audioPlaylistId": "OLAK5uy_x", "artists": [{"name": "Eminem", "id": "UCem"}],
+             "tracks": [{"videoId": "vid00000001", "title": "Walk On Water", "artists": [{"name": "Eminem", "id": "UCem"}, {"name": "Beyonce", "id": "UCb"}],
+                         "album": "Revival", "thumbnails": None, "isAvailable": True, "duration": "5:03", "duration_seconds": 303, "trackNumber": 0},
+                        {"videoId": "vid00000002", "title": "Believe", "artists": [{"name": "Eminem", "id": "UCem"}], "album": "Revival",
+                         "isAvailable": True, "duration": "5:15"},
+                        {"videoId": None, "title": "Greyed out", "artists": []},
+                        {"videoId": "vid00000004", "title": "Gone", "isAvailable": False}]}
+
+    def test_art_picks_biggest_and_resizes(self):
+        self.assertEqual(ytmusic.art(self.THUMBS), "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj")
+        self.assertEqual(ytmusic.art(self.THUMBS, 100), "https://lh3.googleusercontent.com/abc=w100-h100-l90-rj")
+        self.assertEqual(ytmusic.art([{"url": "https://i.ytimg.com/vi/x/hq.jpg", "width": 480, "height": 360}]), "https://i.ytimg.com/vi/x/hq.jpg")
+        self.assertEqual(ytmusic.art(None), "")
+        self.assertEqual(ytmusic.art([{"nope": 1}, "junk"]), "")
+
+    def test_durations(self):
+        self.assertEqual(ytmusic.seconds({"duration_seconds": 259}), 259.0)
+        self.assertEqual(ytmusic.seconds({"duration": "4:19"}), 259.0)
+        self.assertEqual(ytmusic.seconds({"duration": "1:02:03"}), 3723.0)
+        self.assertEqual(ytmusic.seconds({"duration": "soon"}), 0.0)
+        self.assertEqual(ytmusic.seconds({}), 0.0)
+
+    def test_album_page(self):
+        a = ytmusic.shape_album(self.ALBUM, "MPREb_1")
+        self.assertEqual((a["title"], a["artist"], a["year"], a["kind"]), ("Revival", "Eminem", "2017", "Album"))
+        self.assertEqual([t["title"] for t in a["tracks"]], ["Walk On Water", "Believe"])     # no id and unavailable ones are dropped
+        self.assertEqual([t["n"] for t in a["tracks"]], [1, 2])                               # numbered in order shown
+        t = a["tracks"][0]
+        self.assertEqual((t["id"], t["vid"], t["artist"], t["artistId"], t["albumId"], t["dur"]),
+                         ("ytm:vid00000001", "vid00000001", "Eminem, Beyonce", "UCem", "MPREb_1", 303.0))
+        self.assertEqual(t["cover"], a["cover"])                                              # songs wear the album's cover
+        self.assertEqual(a["tracks"][1]["dur"], 315.0)
+        self.assertEqual(a["dur"], 600.0)
+
+    def test_search_rows(self):
+        song = ytmusic.norm_track({"videoId": "vid00000009", "title": "Wonderwall", "artists": [{"name": "Oasis", "id": "UCo"}],
+                                   "album": {"name": "Morning Glory", "id": "MPREb_9"}, "duration_seconds": 259, "thumbnails": self.THUMBS})
+        self.assertEqual((song["artist"], song["album"], song["albumId"], song["cover"].endswith("w544-h544-l90-rj")),
+                         ("Oasis", "Morning Glory", "MPREb_9", True))
+        alb = ytmusic.norm_album({"browseId": "MPREb_1", "playlistId": "OLAK5uy_k", "title": "Morning Glory", "type": "Album",
+                                  "artist": "Oasis", "year": "1995", "thumbnails": self.THUMBS})
+        self.assertEqual((alb["id"], alb["artist"], alb["year"], alb["playlistId"]), ("MPREb_1", "Oasis", "1995", "OLAK5uy_k"))
+        self.assertIsNone(ytmusic.norm_album({"title": "no id"}))
+        art = ytmusic.norm_artist({"browseId": "UCo", "artist": "Oasis", "thumbnails": self.THUMBS})
+        self.assertEqual((art["id"], art["name"]), ("UCo", "Oasis"))
+        pl = ytmusic.norm_playlist({"browseId": "VLPLabc", "title": "Mix", "author": "Tate", "itemCount": "1,174"})
+        self.assertEqual((pl["id"], pl["author"], pl["count"]), ("PLabc", "Tate", 1174))
+        self.assertEqual(ytmusic.norm_playlist({"browseId": "VLPLx", "title": "t", "itemCount": None})["count"], 0)
+
+    def test_artist_page(self):
+        raw = {"name": "Oasis", "thumbnails": self.THUMBS, "monthlyListeners": "29.1M", "radioId": "RDEM",
+               "songs": {"browseId": "VLPLsongs", "results": [{"videoId": "vid00000011", "title": "Wonderwall", "artist": "Oasis", "album": "Morning Glory",
+                                                              "thumbnails": self.THUMBS}]},
+               "albums": {"results": [{"browseId": "MPREb_1", "title": "Morning Glory", "year": "1995", "thumbnails": self.THUMBS}]},
+               "singles": {"results": []}}
+        a = ytmusic.shape_artist(raw, "UCo")
+        self.assertEqual((a["name"], a["listeners"], a["songsBrowseId"]), ("Oasis", "29.1M", "VLPLsongs"))
+        self.assertEqual((a["songs"][0]["artist"], a["songs"][0]["album"], a["songs"][0]["n"]), ("Oasis", "Morning Glory", 1))
+        self.assertEqual((a["albums"][0]["artist"], a["albums"][0]["year"]), ("Oasis", "1995"))
+        self.assertEqual(ytmusic.shape_artist({}, "UCx")["songs"], [])                         # an empty page still has every key
+
+    def test_playlist_page(self):
+        raw = {"title": "Road trip", "author": {"name": "Me", "id": "x"}, "thumbnails": self.THUMBS, "trackCount": 2,
+               "tracks": [{"videoId": "vid00000021", "title": "A", "artists": [{"name": "X", "id": "u"}], "duration_seconds": 100},
+                          {"videoId": "vid00000022", "title": "B", "artists": [], "duration_seconds": 50}]}
+        p = ytmusic.shape_playlist(raw, "PLroad")
+        self.assertEqual((p["title"], p["author"], p["count"], p["dur"]), ("Road trip", "Me", 2, 150.0))
+        self.assertEqual([t["n"] for t in p["tracks"]], [1, 2])
+
+    def test_client_wraps_the_library(self):
+        calls = []
+
+        class Fake:
+            def search(self, q, filter=None, limit=20):
+                calls.append((q, filter))
+                if filter == "albums":
+                    return [{"browseId": "MPREb_1", "title": "A", "artist": "Z"}, "junk", {"title": "no id"}]
+                return [{"videoId": "vid00000031", "title": "S", "artists": [{"name": "Z"}]}]
+
+            def get_album(self, b):
+                return {"title": "A", "tracks": []}
+
+            def get_artist(self, c):
+                raise ConnectionError("offline")
+        c = ytmusic.YtMusic(factory=Fake)
+        self.assertEqual([x["id"] for x in c.search("  z ", "songs")], ["ytm:vid00000031"])
+        self.assertEqual([x["id"] for x in c.search("z", "albums")], ["MPREb_1"])               # bad rows skipped, good ones kept
+        self.assertEqual(calls, [("z", "songs"), ("z", "albums")])
+        self.assertEqual(c.search("   "), [])
+        self.assertEqual(c.album("MPREb_1")["title"], "A")
+        with self.assertRaises(RuntimeError) as cm:
+            c.artist("UCx")
+        self.assertIn("reach YouTube Music", str(cm.exception))
+
+    def test_vendored_library_loads(self):
+        c = ytmusic.YtMusic()
+        self.assertTrue(hasattr(c._client(), "search"))
+
+    def test_recent_plays(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = ytmusic.Store(Path(d))
+            t = lambda n: {"id": f"ytm:vid0000000{n}", "vid": f"vid0000000{n}", "title": f"T{n}", "artist": "A", "cover": "c", "extra": "dropped"}
+            for n in (1, 2, 3, 1):
+                st.played(t(n))
+            self.assertEqual([r["title"] for r in st.recent], ["T1", "T3", "T2"])                # newest first, no repeats
+            self.assertNotIn("extra", st.recent[0])
+            self.assertEqual([r["title"] for r in ytmusic.Store(Path(d)).recent], ["T1", "T3", "T2"])
+            st.clear_recent()
+            self.assertEqual(ytmusic.Store(Path(d)).recent, [])
+
+    def test_lyrics_for_a_track(self):
+        with tempfile.TemporaryDirectory() as d:
+            from unittest import mock
+            asked = []
+
+            def request(url, *a, **k):
+                asked.append(url)
+                return json.dumps([{"syncedLyrics": "[00:01.00] hello\n[00:03.00] world", "duration": 100}]).encode()
+            with mock.patch.object(lyrics, "cache_dir", return_value=Path(d)):
+                got = lyrics.lookup_track("Artist", "Title", "Album", 100, request=request)
+                self.assertTrue(got and got.synced and len(got.lines) == 2)
+                before = len(asked)
+                again = lyrics.lookup_track("Artist", "Title", "Album", 100, request=lambda *a, **k: self.fail("asked twice"))
+                self.assertTrue(again and again.synced)
+                self.assertGreaterEqual(before, 1)
+                self.assertEqual(len(asked), before)                                         # the second lookup came from the cache
+
+    def test_service_lyrics_timed_and_plain(self):
+        class Api:
+            def get_watch_playlist(self, videoId, limit=1):
+                return {"lyrics": "MPLYt_x"} if videoId == "abcdefghijk" else {"lyrics": None}
+
+            def get_lyrics(self, browse, timestamps=False):
+                return {"lyrics": [{"text": "Hello", "start_time": 9200, "end_time": 10000},
+                                   {"text": "World", "start_time": 12500, "end_time": 13000}], "hasTimestamps": True}
+        yt = ytmusic.YtMusic(factory=Api)
+        got = yt.lyrics("abcdefghijk")
+        self.assertTrue(got.synced)
+        self.assertEqual([(l.t, l.text) for l in got.lines], [(9.2, "Hello"), (12.5, "World")])
+        self.assertIsNone(yt.lyrics("zzzzzzzzzzz"))
+
+    def test_service_lyrics_come_before_lrclib(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lyrics, "cache_dir", return_value=Path(d)):
+            own = lyrics.Lyrics([lyrics.Line(1.0, "mine")], True, "youtube music")
+            got = lyrics.lookup_track("A", "T", "", 100, request=lambda *a, **k: self.fail("asked lrclib"), first=lambda: own)
+            self.assertEqual(got.lines[0].text, "mine")
+            plain = lyrics.Lyrics([lyrics.Line(-1.0, "plain")], False, "youtube music")
+            timed = json.dumps([{"syncedLyrics": "[00:01.00] timed\n[00:03.00] lines", "duration": 100}]).encode()
+            got = lyrics.lookup_track("C", "T", "", 100, request=lambda u: timed, first=lambda: plain)
+            self.assertTrue(got.synced)                                                          # timed LRCLIB beats plain text
+            got = lyrics.lookup_track("D", "T", "", 100, request=lambda u: b"[]", first=lambda: plain)
+            self.assertEqual(got.lines[0].text, "plain")                                         # but plain beats nothing
+            miss = lyrics.lookup_track("B", "T", "", 100, request=lambda u: b"[]", first=lambda: None)   # falls back to lrclib
+            self.assertIsNone(miss)
+
+    def test_lyrics_remember_the_recording_length(self):
+        from unittest import mock
+        timed = json.dumps([{"syncedLyrics": "[00:01.00] a\n[00:03.00] b", "duration": 212, "trackName": "T", "artistName": "A"}]).encode()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lyrics, "cache_dir", return_value=Path(d)):
+            got = lyrics.lookup_track("A", "T", "", 212, request=lambda u: timed)
+            self.assertEqual(got.duration, 212.0)
+            again = lyrics.lookup_track("A", "T", "", 212, request=lambda u: self.fail("asked twice"))
+            self.assertEqual(again.duration, 212.0)                                  # and it survives the cache
+
+    def test_refine_finds_the_version_that_fits_the_audio(self):
+        from unittest import mock
+        rows = json.dumps([
+            {"syncedLyrics": "[00:25.00] a\n[00:27.00] b", "duration": 212, "trackName": "T", "artistName": "A"},
+            {"syncedLyrics": "[00:12.00] a\n[00:14.00] b", "duration": 199, "trackName": "T", "artistName": "A"}]).encode()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(lyrics, "cache_dir", return_value=Path(d)):
+            got = lyrics.refine("A", "T", "", 199.4, request=lambda u: b"null" if "/get" in u else rows)
+            self.assertEqual((got.duration, got.lines[0].t), (199.0, 12.0))
+            self.assertIsNone(lyrics.refine("A", "T", "", 150.0, request=lambda u: b"null" if "/get" in u else rows))   # nothing close
+
+    def test_audio_stream_lookup(self):
+        seen = []
+
+        def run(cmd):
+            seen.append(cmd)
+            client = next((c.split("player_client=")[1] for c in cmd if "player_client=" in c), "")
+            if client == "":
+                return json.dumps({"url": "https://s/bad", "title": "Song", "duration": 200, "ext": "m4a", "abr": 128})
+            return json.dumps({"formats": [{"url": "https://s/video", "vcodec": "avc1", "acodec": "none"},
+                                           {"url": "https://s/audio", "vcodec": "none", "acodec": "mp4a", "abr": 128}],
+                               "title": "Song", "duration": 200, "artist": "Band"})
+        dl = youtube.YtDlp(exe="yt-dlp", runner=run)
+        dl.retry_wait = 0
+        got = dl.resolve_audio("abcdefghijk", probe=lambda i: i["url"] != "https://s/bad")
+        self.assertEqual((got["url"], got["dur"], got["channel"], got["audio"]), ("https://s/audio", 200.0, "Band", True))
+        self.assertTrue(all("music.youtube.com/watch?v=abcdefghijk" in c[-1] for c in seen))
+        self.assertTrue(all("bestaudio" in c[c.index("-f") + 1] for c in seen))
+
+        # the client that worked is tried first next time
+        seen.clear()
+        self.assertEqual(dl._audio_good, "android_vr")
+        dl.resolve_audio("abcdefghijk", probe=lambda i: i["url"] != "https://s/bad")
+        self.assertIn("player_client=android_vr", " ".join(seen[0]))
+
+    def test_peek_next(self):
+        q = playqueue.PlayQueue()
+        q.start(["a", "b", "c"], "b")
+        self.assertEqual(q.peek(), "c")
+        self.assertEqual(q.current, "b")                 # peeking doesn't move
+        q.next()
+        self.assertEqual(q.peek(), "")
+        q.set_repeat("one")
+        self.assertEqual(q.peek(), "")
+
+
+class SponsorBlockTests(unittest.TestCase):
+    def test_segments_asks_by_hash_prefix_and_keeps_our_video(self):
+        import hashlib
+        asked = []
+
+        def request(url):
+            asked.append(url)
+            return json.dumps([
+                {"videoID": "other", "segments": [{"segment": [1, 2], "category": "sponsor", "actionType": "skip"}]},
+                {"videoID": "abcdefghijk", "segments": [
+                    {"segment": [30.5, 60], "category": "sponsor", "actionType": "skip"},
+                    {"segment": [0, 5], "category": "intro", "actionType": "skip"},          # not a category we asked for
+                    {"segment": [90, 95], "category": "selfpromo", "actionType": "mute"},   # not a skip
+                    {"segment": [70, 70], "category": "sponsor", "actionType": "skip"}]}])  # empty
+        got = sponsorblock.segments("abcdefghijk", request=request)
+        self.assertEqual(got, [(30.5, 60.0, "sponsor")])
+        self.assertIn(hashlib.sha256(b"abcdefghijk").hexdigest()[:4], asked[0])
+        self.assertNotIn("abcdefghijk", asked[0])                 # the id itself is never sent
+
+    def test_no_segments_when_unknown_or_unreachable(self):
+        import urllib.error
+
+        def notfound(url):
+            raise urllib.error.HTTPError(url, 404, "n", {}, None)
+
+        def down(url):
+            raise OSError("offline")
+        self.assertEqual(sponsorblock.segments("abcdefghijk", request=notfound), [])
+        self.assertEqual(sponsorblock.segments("abcdefghijk", request=down), [])
+        self.assertEqual(sponsorblock.segments("", request=down), [])
+
+    def test_only_chosen_categories_are_asked_for(self):
+        asked = []
+        sponsorblock.segments("abcdefghijk", ("outro", "bogus"), request=lambda u: asked.append(u) or b"[]")
+        self.assertIn("outro", asked[0])
+        self.assertNotIn("bogus", asked[0])
+        self.assertEqual(sponsorblock.segments("abcdefghijk", (), request=lambda u: self.fail("asked with nothing chosen")), [])
+
+    def test_merge_joins_overlaps(self):
+        got = sponsorblock.merge([(50, 60, "sponsor"), (10, 20, "sponsor"), (20.2, 30, "selfpromo"), (55, 70, "sponsor")])
+        self.assertEqual(got, [(10, 30, "sponsor"), (50, 70, "sponsor")])
 
 
 if __name__ == "__main__":

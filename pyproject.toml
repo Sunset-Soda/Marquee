@@ -17,7 +17,10 @@ qt = ["PySide6>=6.6"]
 marquee = "marquee.__main__:main"
 
 [tool.setuptools]
-packages = ["marquee", "marquee.core", "marquee.qt"]
+packages = ["marquee", "marquee.core", "marquee.qt", "marquee._vendor", "marquee._vendor.ytmusicapi",
+            "marquee._vendor.ytmusicapi.auth", "marquee._vendor.ytmusicapi.auth.oauth", "marquee._vendor.ytmusicapi.mixins",
+            "marquee._vendor.ytmusicapi.models", "marquee._vendor.ytmusicapi.models.content", "marquee._vendor.ytmusicapi.parsers"]
 
 [tool.setuptools.package-data]
 "marquee.qt" = ["qml/*.qml", "qml/*.svg", "icon.svg"]
+"marquee._vendor.ytmusicapi" = ["LICENSE", "locales/*/LC_MESSAGES/*", "py.typed"]

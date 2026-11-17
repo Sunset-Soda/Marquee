@@ -55,7 +55,7 @@ Rectangle {
             anchors { left: art.right; leftMargin: Kirigami.Units.largeSpacing; right: parent.right; verticalCenter: parent.verticalCenter }
             spacing: 0
             QQC2.Label { Layout.fillWidth: true; text: bar.music.info.title || ""; color: "white"; font.weight: Font.DemiBold; elide: Text.ElideRight }
-            QQC2.Label { Layout.fillWidth: true; text: bar.music.info.sub || ""; color: bar.dim; font: Kirigami.Theme.smallFont; elide: Text.ElideRight }
+            QQC2.Label { Layout.fillWidth: true; text: bar.music.loading ? "Loading…" : (bar.music.errorText !== "" ? "Couldn’t play this song" : (bar.music.info.sub || "")); color: bar.dim; font: Kirigami.Theme.smallFont; elide: Text.ElideRight }
         }
         TapHandler { onTapped: bar.openRequested() }
         HoverHandler { cursorShape: Qt.PointingHandCursor }
