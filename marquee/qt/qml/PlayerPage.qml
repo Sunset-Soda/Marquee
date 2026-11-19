@@ -26,6 +26,7 @@ Kirigami.Page {
     readonly property bool wideLayout: width >= Kirigami.Units.gridUnit * 36
     readonly property bool lyricsShown: !isVideo && music.lyricsOn
     property real resumeAt: 0
+    property string retriedId: ""                  // a YouTube video already re-opened once after failing (so a real failure still shows)
     property string errorText: ""
     readonly property bool isVideo: info.media === "video"
     // Live TV: a stream with no end, no seeking and no resume point. `nowNext` feeds the on-screen guide strip.
@@ -383,6 +384,7 @@ Kirigami.Page {
         videoOutput: video
         playbackRate: [0.75, 1, 1.25, 1.5, 2][speed.currentIndex]
         onMediaStatusChanged: {
+            if (mediaStatus === MediaPlayer.BufferedMedia) pp.retriedId = ""
             if (mediaStatus === MediaPlayer.LoadedMedia && pp.resumeAt > 0) { position = pp.resumeAt; pp.resumeAt = 0 }
             if (mediaStatus === MediaPlayer.EndOfMedia) {
                 if (pp.isLive) { pp.errorText = "The stream for “" + pp.info.title + "” ended. The channel may be off air, or your connection dropped."; return }
@@ -390,6 +392,13 @@ Kirigami.Page {
             }
         }
         onErrorOccurred: (error, message) => {
+            // a YouTube video left paused for a long time can lose its source: open it again from where it was, once, before giving up
+            if (!!pp.info.yt && !pp.isLive && pp.retriedId !== pp.info.id) {
+                pp.retriedId = pp.info.id
+                console.log("marquee: youtube: playback failed (" + message + "); reopening " + pp.info.id + " at " + Math.round(videoPlayer.position / 1000) + "s")
+                youtube.reopen(pp.info.id.substring(3), videoPlayer.position / 1000, youtube.quality)
+                return
+            }
             pp.errorText = pp.isLive
                 ? "Couldn’t open “" + pp.info.title + "”. " + message + " The channel may be offline, or the playlist link may have expired."
                 : "This system could not play “" + pp.info.title + "”. " + message +
