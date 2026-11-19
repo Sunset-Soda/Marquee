@@ -1,6 +1,6 @@
 <p align="center"><img src="data/io.github.marquee.Marquee.svg" width="96" alt="Marquee"></p>
 <h1 align="center">Marquee</h1>
-<p align="center">A media library and player for your own movies, TV and music, with YouTube and Live TV built in.<br>
+<p align="center">One app for your own movies, TV and music, plus YouTube, YouTube Music, Shorts, Podcasts, Twitch and Live TV.<br>
 Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows build is planned.</p>
 
 ## Screenshots
@@ -13,17 +13,22 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 
 ## Highlights
 
-- **Library:** Movies, TV Shows, Music and Podcasts, with cover art looked up online.
-- **YouTube without an account:** search, channels, playlists, subscriptions (Google Takeout import), history,
-  quality menu with Auto, resume where you left off, fast start.
-- **YouTube Music:** search songs, albums, artists and playlists with no account. Album and artist pages look like the Music tab, and songs play in the same mini player with lyrics and media keys. Needs the `requests` Python package.
-- **YouTube Shorts:** a vertical feed with auto-scroll, a "For you" mix built from your subscriptions and (if you sign in with a browser) YouTube's own recommendations, and a "More like this" button.
-- **Podcasts:** search, subscribe by name, RSS link or Apple Podcasts link, resume where you stopped, and playback speed. Playback carries on while you browse.
-- **Twitch:** sign in with a code, see which followed channels are live, and watch them at the size you pick. Needs your own free Twitch developer Client ID. An optional ad-free switch uses a proxy address you provide. If it fails, the normal stream is used. A commercial break at the start of a channel plays in full and then the channel starts.
-- **Live TV:** M3U playlists with an XMLTV guide. Picks the largest picture size the stream offers.
-- **Music:** artist pages, lyrics, visualiser, background mini player.
-- **Subtitles:** automatic sync and download from OpenSubtitles, with Subdl as an optional backup.
-- **SponsorBlock:** skips sponsor reads and similar parts of YouTube videos, and you choose which kinds.
+**Your own files**
+- **Library:** Movies, TV Shows and Music, with cover art looked up online, resume where you left off, a Continue list, favourites, and grid or list views.
+- **Music:** artist and album pages, lyrics that follow the song, a visualiser, and a mini player that keeps going while you browse.
+- **Subtitles:** files beside the video, tracks inside it, automatic download from OpenSubtitles (Subdl as a backup) and automatic syncing to the speech.
+
+**Online, no account needed**
+- **YouTube:** search, channels, playlists, subscriptions (Google Takeout import), history, a quality menu with Auto, fast start, and SponsorBlock to skip sponsor reads.
+- **YouTube Music:** songs, albums, artists and playlists in the same mini player, with lyrics and media keys. Needs the `requests` Python package.
+- **YouTube Shorts:** a vertical feed with auto-scroll, a "For you" mix, and "More like this".
+- **Podcasts:** search, subscribe by name, RSS link or Apple Podcasts link, resume where you stopped, and playback speed.
+- **Live TV:** M3U playlists with an XMLTV guide, and the largest picture size the stream offers.
+
+**With an account**
+- **Twitch:** sign in with a code, see who you follow (live first, tiles or a list, with search), and watch at the size you pick. Commercial breaks play in full and the channel carries on after them. Needs your own free Twitch developer Client ID.
+
+**Everything in one place:** all settings, including your subtitle keys, are in **Settings** (Ctrl+,). Marquee keeps a log file you can attach to a bug report.
 
 ## Download
 
@@ -57,10 +62,10 @@ Run with `python3 -m marquee`, or `pip install .[qt]`. `bash install-desktop.sh`
 
 ## Library features
 
-Media (Movies, TV Shows, Music, Podcasts), Library / Continue / Favorites tabs,
+Media (Movies, TV Shows, Music), Library / Continue / Favorites tabs,
 search, grid and list views, adjustable cover size, drag and drop, folder import, file name
 parsing (`Movie.1999.1080p.mkv`, `Show.S01E02.mkv`, `Artist - Song.mp3`), MP3 tags and embedded covers, cover
-art lookup (iTunes Search API for movies, music and podcasts; TVmaze for TV), manual cover choice, resume where you stopped (videos only; songs always start from the top), queue with next/previous, and
+art lookup (iTunes Search API for movies and music; TVmaze for TV), manual cover choice, resume where you stopped (videos only; songs always start from the top), queue with next/previous, and
 subtitles, and three built-in sample tracks so the player works on first launch.
 
 **Media keys:** the keyboard's play/pause, next and previous keys, and your desktop's media widget, control Marquee through MPRIS. They act on the video or channel on screen, otherwise on the music player.
@@ -145,14 +150,14 @@ Press **C** or use the **CC** button in the player. Marquee offers, in this orde
 
 **Syncing.** Subtitles that start late or early are lined up on their own: ffmpeg listens for speech in the video, the app slides the subtitle over it to find the best fit (up to two minutes either way) and also tries the common frame-rate mismatches (23.976, 24 and 25 fps) for subtitles that drift as the film goes on. It runs once per subtitle track in the background, never for tracks inside the video file, and the timing it finds is remembered for that video. Use **Sync Subtitles to the Speech** in the CC menu to run it again, or turn the automatic run off there. Without ffmpeg nothing is synced; **Show Earlier / Later** still works.
 
-**Downloading.** Open **Subtitle Settings** from the menu and enter the API key, username and password of a free
+**Downloading.** Open **Settings** (Ctrl+,), go to Subtitles, and enter the API key, username and password of a free
 [OpenSubtitles.com](https://www.opensubtitles.com) account (the key is under Profile › API consumers). When a
 video has no subtitles, Marquee then looks one up automatically, once per video, and saves it as
 `Movie.en.srt` beside the video (or in `~/.cache/marquee/subs/` if that folder is read-only). Matching uses a hash
 of the file first, then the show, season and episode or the movie title and year. **CC › Download Subtitles** does
 it on demand. Your key and login are stored in `~/.local/share/marquee/opensubtitles.json`, readable only by you.
 
-**Backup source (Subdl).** Optionally add a free API key from [subdl.com](https://subdl.com) in the same dialog. Marquee asks
+**Backup source (Subdl).** Optionally add a free API key from [subdl.com](https://subdl.com) in the same Subtitles section of Settings. Marquee asks
 OpenSubtitles first and tries Subdl when it finds nothing for that episode or movie, or can't be used (for example, the
 daily download limit was reached). Shows are searched by their IMDb number, so a remake with the same name is never
 confused with the original. The key is stored in the same private file.
@@ -208,6 +213,37 @@ fits; if a song is still early or late, **[** and **]** nudge the lyrics by 0.1 
 0.5 s, remembered for that song. The next song is looked up while the current one plays, so it starts quickly.
 
 It uses the same `yt-dlp` setup as YouTube, plus the `requests` package (see Install).
+
+## YouTube Shorts (Qt frontend)
+
+Choose **Shorts** in the sidebar for a vertical feed. Videos play one at a time and the next two load ahead of you, so
+swiping on is quick. **Auto-scroll** moves to the next Short when one ends. **For you** mixes recent videos from
+channels you subscribe to with, if you picked a browser under Settings › YouTube, YouTube's own recommendations.
+**More like this** starts a feed based on the Short you are watching.
+
+## Podcasts (Qt frontend)
+
+Choose **Podcasts** in the sidebar. Search by name, or paste an RSS link or an Apple Podcasts link, and subscribe.
+Your subscriptions list their latest episodes. Marquee remembers where you stopped in each episode, offers playback
+speeds, and keeps playing while you browse (the player is the same bar as for music).
+
+## Twitch (Qt frontend)
+
+Choose **Twitch** in the sidebar.
+
+1. Make a free application at [dev.twitch.tv/console](https://dev.twitch.tv/console) (Client Type: Public, OAuth
+   Redirect URL `http://localhost`). Every app that signs in with Twitch needs one, so Marquee asks for yours.
+2. Paste its Client ID into Marquee and press **Sign in with Twitch**. You get a short code to type at
+   twitch.tv/activate; no password goes through Marquee.
+3. **Live now** shows who you follow that is streaming, most viewers first; everyone else is listed under **Offline**
+   with their picture. The button next to refresh switches between tiles and a list, and a search box appears when you
+   follow many channels. You can also type any channel name or paste a twitch.tv link to watch it without signing in.
+
+Pick the picture size (Best, 1080p, 720p, 480p, 360p) in the player or in the Twitch settings. Twitch puts commercial
+breaks into the video; Marquee plays a break in full as its own video and then goes back to the channel. There is an
+optional **ad-free mode** that asks for the stream through a proxy address you supply. It depends on someone else's
+server, is against Twitch's terms, can stop working at any time, and Marquee falls back to the normal stream and says
+so when it does. You can also let it use your browser's Twitch login (for Turbo or a subscription).
 
 ## Live TV (Qt frontend)
 
