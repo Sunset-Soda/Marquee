@@ -44,9 +44,8 @@ KINDS: tuple[Kind, ...] = (
     Kind("show", "TV Shows", 2 / 3, "video-television", "video-display-symbolic"),
     Kind("music", "Music", 1.0, "audio-x-generic", "audio-x-generic-symbolic"),
     Kind("podcast", "Podcasts", 1.0, "audio-input-microphone", "audio-input-microphone-symbolic"),
-    Kind("home", "Home Videos", 16 / 10, "camera-video", "camera-video-symbolic"),
-    Kind("book", "Audiobooks", 2 / 3, "audio-headphones", "audio-headphones-symbolic"),
 )
+RETIRED = {"home": "movie", "book": "podcast"}   # Home Videos and Audiobooks were removed: such items move to the nearest kind
 KIND = {k.id: k for k in KINDS}
 ALL = "all"
 TABS = ("library", "continue", "favorites")
@@ -231,6 +230,8 @@ class Library:
         self.seeded = bool(raw.get("seeded"))
         self.prefs = dict(raw.get("prefs") or {})
         self.items = [Item(**{k: v for k, v in d.items() if k in known}) for d in raw.get("items", []) if "id" in d]
+        for it in self.items:
+            it.kind = RETIRED.get(it.kind, it.kind)
         show_fields = {f.name for f in fields(Show)}
         for d in raw.get("shows", []):
             if "key" in d:

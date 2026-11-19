@@ -620,6 +620,33 @@ class YtDlp:
         raise RuntimeError("YouTube won’t let Marquee stream this particular video (every address was refused, HTTP 403). "
                            "Other videos should still play. " + (self.diagnose(video_id) or "").strip())
 
+    def short_level(self, quality: str, dur: float, speed: float = 0.0) -> int:
+        """The picture size to fetch for a Short without asking YouTube first. A size you chose is used as it is; Auto takes
+        the biggest of 1080, 720 and 480 whose download (about what a Short that long weighs) fits the time allowed."""
+        if str(quality).isdigit():
+            return min(1080, int(quality))
+        dur = dur if dur > 0 else 60.0
+        allowed = (speed or DEFAULT_SPEED) * AUTO_BUDGET * 1.5          # the next ones are fetched while one plays
+        for res, per_second in ((1080, 600_000), (720, 300_000)):
+            if dur * per_second <= allowed:
+                return res
+        return 480
+
+    def resolve_short(self, video_id: str, known: dict, quality: str = "auto", speed: float = 0.0) -> dict:
+        """Like resolve(), for a Short the page already knows the title and length of. A normal lookup asks YouTube twice
+        (what sizes exist, then the download); this goes straight to the download, which halves the wait. If that fails it
+        falls back to the full lookup."""
+        want = self.short_level(quality, float(known.get("dur") or 0), speed)
+        if want <= 360:
+            return self.resolve(video_id, quality=quality, speed=speed, fast=False)
+        meta = {"id": video_id, "title": known.get("title") or "", "channel": known.get("channel") or "",
+                "dur": float(known.get("dur") or 0), "thumb": known.get("thumb") or "", "live": False, "levels": []}
+        try:
+            return self.fetch_dash(video_id, meta, want)
+        except RuntimeError as e:
+            print(f"[youtube] {video_id}: direct {want}p fetch failed ({str(e)[:100]}); using the full lookup", file=sys.stderr, flush=True)
+            return self.resolve(video_id, quality=quality, speed=speed, fast=False)
+
     _audio_good = ""        # the player client that last gave a working audio address
 
     # ---- audio only, for YouTube Music --------------------------------------------------------------------

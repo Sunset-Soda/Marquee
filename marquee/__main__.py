@@ -20,6 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.debug_appearance:
         print(desktop.describe(dt))
         return 0
+    from .core import logfile
+    logfile.start()
     desktop.prepare_qt_environment(dt)
     from .qt.app import run
     return run(args.files, rest, dt)

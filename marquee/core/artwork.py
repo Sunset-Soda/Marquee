@@ -15,12 +15,11 @@ from typing import Callable
 from . import net, tv
 from .library import Item, Library
 
-# kind -> (media, entity) for the iTunes Search API. TV is handled by tv.py. Home videos have no catalogue.
+# kind -> (media, entity) for the iTunes Search API. TV is handled by tv.py.
 LOOKUP = {
     "movie": ("movie", "movie"),
     "music": ("music", "song"),
     "podcast": ("podcast", "podcast"),
-    "book": ("audiobook", "audiobook"),
 }
 
 

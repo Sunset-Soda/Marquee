@@ -7,7 +7,7 @@ import time as _time
 from PySide6.QtCore import (Property, QAbstractListModel, QByteArray, QModelIndex, QObject, QUrl, Qt, Signal, Slot)
 from PySide6.QtGui import QImage
 
-from ..core import artwork, iptv, lyrics, opensubs, palette, playqueue, spectrum, sponsorblock, subsync, subtitles, tv
+from ..core import artwork, hls, iptv, lyrics, opensubs, palette, playqueue, spectrum, sponsorblock, subsync, subtitles, tv
 from ..core.library import ALL, KIND, KINDS, Item, Library, path_kind
 from ..core.nav import Navigator, View
 
@@ -100,6 +100,7 @@ class Controller(QObject):
     lyricsReady = Signal(str, "QVariantList", bool, str)
     _lyrics_done = Signal(str, object)
     liveChanged = Signal()
+    liveVariants = Signal(str, "QVariantList")      # a channel's offered picture sizes, biggest first: "live:<id>", [{url, width, height, bandwidth}]
     _live_done = Signal(str)
 
     def __init__(self, library: Library, parent=None):
@@ -568,10 +569,10 @@ class Controller(QObject):
         it = self.lib.by_id(item_id)
         if not it:
             return {}
-        return {"id": it.id, "title": it.title, "sub": it.sub or KIND[it.kind].name, "media": it.media,
+        return {"id": it.id, "title": it.title, "sub": it.sub or KIND.get(it.kind, KINDS[0]).name, "media": it.media,
                 "url": _url(it.path), "exists": it.exists, "pos": it.pos if it.resumable else 0.0, "dur": it.dur,
                 "subDelay": it.sub_delay,
-                "cover": _url(self.lib.cover_for(it)), "icon": KIND[it.kind].qt_icon}
+                "cover": _url(self.lib.cover_for(it)), "icon": KIND.get(it.kind, KINDS[0]).qt_icon}
 
     # ---- Now Playing: colours from the cover and the audio visualiser -------
     @Slot(str, result="QVariantMap")
@@ -660,6 +661,15 @@ class Controller(QObject):
         self.lib.prefs["viz"] = style
         self.lib.save()
         self.vizStyleChanged.emit()
+
+    @Slot(result=bool)
+    def shortsAutoScroll(self):
+        return bool(self.lib.prefs.get("shorts_autoscroll", True))
+
+    @Slot(bool)
+    def setShortsAutoScroll(self, on: bool):
+        self.lib.prefs["shorts_autoscroll"] = bool(on)
+        self.lib.save()
 
     @Slot(result=bool)
     def lyricsDefault(self):
@@ -909,6 +919,22 @@ class Controller(QObject):
         return self._pq.previous()
 
     # ---- live TV (IPTV) -----------------------------------------------
+    @Slot(str)
+    def probeLive(self, item_id: str):
+        """Read what picture sizes a channel offers (off the UI thread), print them, and say liveVariants."""
+        ch = self._live.by_id.get(item_id[5:] if item_id.startswith("live:") else item_id)
+        if not ch:
+            return
+
+        def work():
+            vs = hls.variants(ch.url)
+            if vs:
+                print(f"marquee: live: {ch.name}: offers {hls.describe(vs)}", flush=True)
+            else:
+                print(f"marquee: live: {ch.name}: one version only (not an HLS list of sizes)", flush=True)
+            self.liveVariants.emit(item_id, vs)
+        threading.Thread(target=work, daemon=True).start()
+
     def _live_info(self, cid: str):
         ch = self._live.by_id.get(cid)
         if not ch:

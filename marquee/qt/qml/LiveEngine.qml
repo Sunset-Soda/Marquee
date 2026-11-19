@@ -25,14 +25,53 @@ Item {
         errorText = ""
         channelId = id
         title = info.title || ""
+        triedUpgrade = false
+        offered = []
         mp.source = info.url || ""
         mp.play()
+        marquee.probeLive(id)                               // what sizes does this channel offer? (printed in the terminal)
     }
     function stop() {
         mp.stop()
         mp.source = ""
         channelId = ""
         errorText = ""
+        offered = []
+        checkTimer.stop()
+    }
+    // When the stream holds several picture sizes and the player started a smaller one, show the biggest.
+    property bool triedUpgrade: false
+    property var offered: []
+    Connections {
+        target: marquee
+        function onLiveVariants(id, list) {
+            if (id !== "live:" + eng.channelId && id !== eng.channelId) return
+            eng.offered = list
+            if (!eng.triedUpgrade) checkTimer.restart()
+        }
+    }
+    Timer {
+        id: checkTimer
+        interval: 3000                                      // give the player time to open the stream and list its pictures
+        onTriggered: {
+            if (eng.triedUpgrade) return
+            eng.triedUpgrade = true
+            // The stream stays as it is (the sound is a separate part of the list, so swapping the address would lose it);
+            // only the picture is chosen: the biggest one the player found inside it.
+            var tracks = mp.videoTracks
+            var bestAt = -1, bestH = 0, curH = 0
+            for (var i = 0; i < tracks.length; i++) {
+                var r = tracks[i].value(MediaMetaData.Resolution)
+                var h = r ? r.height : 0
+                if (i === mp.activeVideoTrack) curH = h
+                if (h > bestH) { bestH = h; bestAt = i }
+            }
+            console.log("marquee: live: " + eng.title + ": picture " + (curH ? curH + "p" : "unknown") + " of " + tracks.length + " found in the stream, biggest " + (bestH ? bestH + "p" : "unknown"))
+            if (bestAt >= 0 && bestH > curH && bestAt !== mp.activeVideoTrack) {
+                console.log("marquee: live: " + eng.title + ": showing the " + bestH + "p picture")
+                mp.activeVideoTrack = bestAt
+            }
+        }
     }
     MediaPlayer {
         id: mp

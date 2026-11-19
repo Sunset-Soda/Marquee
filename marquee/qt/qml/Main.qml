@@ -38,6 +38,10 @@ Kirigami.ApplicationWindow {
     // Songs play in the window's own music player, so they carry on while you browse. Videos play on their page.
     readonly property var music: musicEngine
     MusicEngine { id: musicEngine }
+    // Podcast episodes play in the window's podcast player, so one carries on while you browse. Music and episodes never play together.
+    readonly property var podcast: podEngine
+    PodcastEngine { id: podEngine }
+    Connections { target: musicEngine; function onTrackChanged() { if (musicEngine.active) podEngine.pause() } }
     // Live TV's single player, shared by the Live TV page's preview and the full-size player.
     readonly property var live: liveEngine
     LiveEngine { id: liveEngine }
@@ -52,6 +56,8 @@ Kirigami.ApplicationWindow {
             if (pg && pg.player)
                 marquee.setMediaState(pg.info.title || "", pg.info.sub || "", pg.info.cover || "",
                                       pg.player.playbackState === MediaPlayer.PlayingState, true)
+            else if (podEngine.active && !musicEngine.active)
+                marquee.setMediaState(podEngine.info.title || "", podEngine.info.sub || "", podEngine.info.cover || "", podEngine.playing, true)
             else
                 marquee.setMediaState(musicEngine.info.title || "", musicEngine.info.sub || "", musicEngine.info.cover || "",
                                       musicEngine.playing, musicEngine.active)
@@ -68,6 +74,11 @@ Kirigami.ApplicationWindow {
                 else if (cmd === "next") pg.step(1)
                 else if (cmd === "previous") pg.step(-1)
                 else if (cmd === "stop") { p.pause() }
+            } else if (podEngine.active && !musicEngine.active) {
+                if (cmd === "playpause" || (cmd === "play" && !podEngine.playing) || (cmd === "pause" && podEngine.playing)) podEngine.toggle()
+                else if (cmd === "next") podEngine.skip(30)
+                else if (cmd === "previous") podEngine.skip(-15)
+                else if (cmd === "stop") podEngine.pause()
             } else if (musicEngine.active) {
                 if (cmd === "playpause" || (cmd === "play" && !musicEngine.playing) || (cmd === "pause" && musicEngine.playing)) musicEngine.toggle()
                 else if (cmd === "next") musicEngine.next(false)
@@ -84,7 +95,10 @@ Kirigami.ApplicationWindow {
     property bool liveActive: false
     property bool youtubeActive: false
     property bool ytmusicActive: false
-    readonly property bool inLibrary: !liveActive && !youtubeActive && !ytmusicActive
+    property bool shortsActive: false
+    property bool podcastsActive: false
+    property bool twitchActive: false
+    readonly property bool inLibrary: !liveActive && !youtubeActive && !ytmusicActive && !shortsActive && !podcastsActive && !twitchActive
     // The channel playing in the small preview box on the Live TV page ("" = none). Set when you leave a live
     // channel with Back or Guide, so it carries on while you look for another.
     property string pipId: ""
@@ -95,6 +109,9 @@ Kirigami.ApplicationWindow {
         liveActive = true
         youtubeActive = false
         ytmusicActive = false
+        shortsActive = false
+        podcastsActive = false
+        twitchActive = false
     }
     function showYoutube() {
         pipId = ""
@@ -103,8 +120,14 @@ Kirigami.ApplicationWindow {
         if (youtubeActive) return
         pageStack.replace(Qt.resolvedUrl("YoutubePage.qml"), { music: musicEngine })
         youtubeActive = true
+        shortsActive = false
+        podcastsActive = false
+        twitchActive = false
         liveActive = false
         ytmusicActive = false
+        shortsActive = false
+        podcastsActive = false
+        twitchActive = false
     }
     function showYtMusic() {
         pipId = ""
@@ -113,6 +136,48 @@ Kirigami.ApplicationWindow {
         if (ytmusicActive) return
         pageStack.replace(Qt.resolvedUrl("YtMusicPage.qml"), { music: musicEngine })
         ytmusicActive = true
+        shortsActive = false
+        podcastsActive = false
+        twitchActive = false
+        youtubeActive = false
+        liveActive = false
+    }
+    function showShorts() {
+        pipId = ""
+        liveEngine.stop()
+        leavePlayer()
+        if (shortsActive) return
+        pageStack.replace(Qt.resolvedUrl("ShortsPage.qml"), { music: musicEngine, pod: podEngine })
+        shortsActive = true
+        podcastsActive = false
+        twitchActive = false
+        ytmusicActive = false
+        youtubeActive = false
+        liveActive = false
+    }
+    function showTwitch() {
+        pipId = ""
+        liveEngine.stop()
+        leavePlayer()
+        if (twitchActive) return
+        pageStack.replace(Qt.resolvedUrl("TwitchPage.qml"), { music: musicEngine, pod: podEngine })
+        twitchActive = true
+        podcastsActive = false
+        shortsActive = false
+        ytmusicActive = false
+        youtubeActive = false
+        liveActive = false
+    }
+    function showPodcasts() {
+        pipId = ""
+        liveEngine.stop()
+        leavePlayer()
+        if (podcastsActive) return
+        pageStack.replace(Qt.resolvedUrl("PodcastsPage.qml"), { music: musicEngine, pod: podEngine, win: root })
+        podcastsActive = true
+        twitchActive = false
+        shortsActive = false
+        ytmusicActive = false
         youtubeActive = false
         liveActive = false
     }
@@ -132,6 +197,9 @@ Kirigami.ApplicationWindow {
         liveActive = false
         youtubeActive = false
         ytmusicActive = false
+        shortsActive = false
+        podcastsActive = false
+        twitchActive = false
     }
     function playLive(channelId) {
         pipId = ""
@@ -174,18 +242,23 @@ Kirigami.ApplicationWindow {
             delegate: QQC2.ItemDelegate {
                 required property var modelData
                 Layout.fillWidth: true
-                highlighted: root.inLibrary && marquee.collection === modelData.id
+                // Podcasts is the feeds page (search, RSS, subscriptions); podcast files on this computer are one button away
+                readonly property bool feeds: modelData.id === "podcast"
+                highlighted: feeds ? root.podcastsActive : (root.inLibrary && marquee.collection === modelData.id)
                 onClicked: {
-                    root.showLibrary()
-                    marquee.setCollection(modelData.id)
+                    if (feeds) root.showPodcasts()
+                    else {
+                        root.showLibrary()
+                        marquee.setCollection(modelData.id)
+                    }
                     if (drawer.modal) drawer.close()
                 }
                 contentItem: RowLayout {
                     spacing: Kirigami.Units.largeSpacing
                     Kirigami.Icon {
                         // Movies and Music: the theme's own icons are coloured; these follow the text colour like the others
-                        readonly property bool plain: modelData.id === "movie" || modelData.id === "music"
-                        source: plain ? Qt.resolvedUrl(modelData.id + ".svg") : modelData.icon
+                        readonly property bool plain: modelData.id === "movie" || modelData.id === "music" || modelData.id === "podcast"
+                        source: plain ? Qt.resolvedUrl((modelData.id === "podcast" ? "podcasts" : modelData.id) + ".svg") : modelData.icon
                         isMask: plain
                         color: Kirigami.Theme.textColor
                         implicitWidth: Kirigami.Units.iconSizes.smallMedium
@@ -193,7 +266,7 @@ Kirigami.ApplicationWindow {
                     }
                     QQC2.Label { text: modelData.name; Layout.fillWidth: true; elide: Text.ElideRight }
                     QQC2.Label {
-                        text: modelData.count > 0 ? modelData.count : ""
+                        text: modelData.count > 0 && modelData.id !== "podcast" ? modelData.count : ""
                         opacity: 0.7
                         font: Kirigami.Theme.smallFont
                     }
@@ -262,6 +335,44 @@ Kirigami.ApplicationWindow {
                 QQC2.Label { text: "YouTube Music"; Layout.fillWidth: true; elide: Text.ElideRight }
             }
         }
+        QQC2.ItemDelegate {
+            Layout.fillWidth: true
+            highlighted: root.shortsActive
+            onClicked: {
+                root.showShorts()
+                if (drawer.modal) drawer.close()
+            }
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+                Kirigami.Icon {
+                    source: Qt.resolvedUrl("shorts.svg")
+                    isMask: true
+                    color: Kirigami.Theme.textColor
+                    implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                    implicitHeight: Kirigami.Units.iconSizes.smallMedium
+                }
+                QQC2.Label { text: "Shorts"; Layout.fillWidth: true; elide: Text.ElideRight }
+            }
+        }
+        QQC2.ItemDelegate {
+            Layout.fillWidth: true
+            highlighted: root.twitchActive
+            onClicked: {
+                root.showTwitch()
+                if (drawer.modal) drawer.close()
+            }
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+                Kirigami.Icon {
+                    source: Qt.resolvedUrl("twitch.svg")
+                    isMask: true
+                    color: Kirigami.Theme.textColor
+                    implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                    implicitHeight: Kirigami.Units.iconSizes.smallMedium
+                }
+                QQC2.Label { text: "Twitch"; Layout.fillWidth: true; elide: Text.ElideRight }
+            }
+        }
         Item { Layout.fillHeight: true }
     }
 
@@ -274,6 +385,7 @@ Kirigami.ApplicationWindow {
     Connections {
         target: youtube
         function onReady(id) {
+            podEngine.pause()
             musicEngine.stop()
             liveEngine.stop()
             if (pageStack.depth > 1) pageStack.pop()

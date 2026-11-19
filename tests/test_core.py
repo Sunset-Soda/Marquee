@@ -1,6 +1,7 @@
 import os
 import struct
 import sys
+import random
 import tempfile
 import urllib.error
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from marquee.core import artwork, desktop, iptv, youtube, ytmusic, library, lyrics, opensubs, palette, parse, playqueue, samples, spectrum, sponsorblock, subsync, subtitles, tv  # noqa: E402
+from marquee.core import hls, twitch, podcasts, artwork, desktop, iptv, youtube, ytmusic, library, lyrics, opensubs, palette, parse, playqueue, samples, shorts, spectrum, sponsorblock, subsync, subtitles, tv  # noqa: E402
 import json  # noqa: E402
 
 
@@ -141,6 +142,17 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual((len(again), skipped), (0, 3))
         loaded = library.Library().load()
         self.assertEqual(sorted(i.kind for i in loaded.items), ["movie", "music", "show"])
+
+    def test_removed_kinds_move_to_the_nearest_kind(self):
+        lib = library.Library()
+        lib.add_paths([self.media], probe=False)
+        lib.items[0].kind = "home"
+        lib.items[1].kind = "book"
+        lib.save()
+        loaded = library.Library().load()
+        self.assertEqual({k.id for k in library.KINDS}, {"movie", "show", "music", "podcast"})
+        self.assertEqual({loaded.items[0].kind, loaded.items[1].kind}, {"movie", "podcast"})
+        self.assertTrue(all(i.kind in library.KIND for i in loaded.items))
 
     def test_filters(self):
         lib = library.Library()
@@ -2047,5 +2059,516 @@ class SponsorBlockTests(unittest.TestCase):
         self.assertEqual(got, [(10, 30, "sponsor"), (50, 70, "sponsor")])
 
 
+class ShortDiscoveryTests(unittest.TestCase):
+    class Dlp:
+        def search(self, q, n):
+            return [{"id": f"{abs(hash(q)) % 10**6:06d}{i:05d}"[:11], "title": q, "channel": "Other", "channelId": "UCother", "dur": 20.0, "live": False}
+                    for i in range(n)]
+
+    def test_topics_come_from_history(self):
+        hist = [{"title": "How to make the BEST sourdough bread at home!"}]
+        t = shorts.topics_from(hist, random.Random(1), 1)
+        self.assertEqual(t, ["make sourdough bread home"])
+        self.assertEqual(shorts.topics_from([], random.Random(1)), [])
+
+    def test_for_you_mixes_subscriptions_and_new_finds(self):
+        subs = [{"id": "UCsub", "name": "Sub"}]
+        d = self.Dlp()
+        d._json = lambda *a: {"channel": "Sub", "entries": [{"id": f"sub{i:08d}"[:11], "title": "s", "duration": 20} for i in range(6)]}
+        rows = shorts.for_you(d, subs, [{"title": "Cats playing piano"}], random.Random(3))
+        chans = {r["channel"] for r in rows}
+        self.assertIn("Sub", chans)
+        self.assertIn("Other", chans)                              # not only channels you follow
+        self.assertEqual(len({r["id"] for r in rows}), len(rows))  # no repeats
+
+    def test_for_you_follows_the_accounts_recommendations(self):
+        d = self.Dlp()
+        d._json = lambda *a: {"channel": "Rec Chan", "entries": [{"id": f"rec{i:08d}"[:11], "title": "r", "duration": 20} for i in range(4)]}
+        recs = [{"id": "short000001", "title": "Quick tip", "channel": "X", "channelId": "UCrec", "dur": 25.0, "live": False},
+                {"id": "long0000001", "title": "Deep dive into woodworking joints", "channel": "Y", "channelId": "UCrec2", "dur": 900.0, "live": False}]
+        rows = shorts.for_you(d, [], [], random.Random(3), recs=recs)
+        ids = [r["id"] for r in rows]
+        self.assertEqual(ids[0], "short000001")                    # a Short in the home feed comes first, as it is
+        self.assertNotIn("long0000001", ids)                       # a long video is not a Short
+        self.assertTrue(any(r["channel"] == "Rec Chan" for r in rows))   # the channels the feed shows
+
+    def test_for_you_without_subscriptions(self):
+        rows = shorts.for_you(self.Dlp(), [], [], random.Random(3))
+        self.assertTrue(rows)
+        self.assertTrue(all(r["channel"] == "Other" for r in rows))
+
+
+class ShortFetchTests(unittest.TestCase):
+    def setUp(self):
+        self.d = youtube.YtDlp.__new__(youtube.YtDlp)
+        self.calls = []
+        self.d.fetch_dash = lambda vid, meta, res: (self.calls.append(("dash", res, meta["dur"])) or {"id": vid, "file": "/x", "res": res})
+        self.d.resolve = lambda vid, **kw: (self.calls.append(("full", kw.get("quality"))) or {"id": vid})
+
+    def test_chosen_size_is_used(self):
+        self.assertEqual(self.d.short_level("720", 30), 720)
+        self.assertEqual(self.d.short_level("1080", 30), 1080)
+
+    def test_auto_drops_on_a_slow_connection(self):
+        self.assertEqual(self.d.short_level("auto", 30, 5_000_000), 1080)
+        self.assertEqual(self.d.short_level("auto", 60, 400_000), 480)
+        self.assertEqual(self.d.short_level("auto", 0, 0), 1080)         # length unknown, speed not measured yet
+
+    def test_goes_straight_to_the_download(self):
+        out = self.d.resolve_short("abc", {"dur": 30, "title": "t"}, quality="1080")
+        self.assertEqual(out["res"], 1080)
+        self.assertEqual(self.calls, [("dash", 1080, 30.0)])             # one yt-dlp call, no separate lookup first
+
+    def test_small_size_streams(self):
+        self.d.resolve_short("abc", {}, quality="360")
+        self.assertEqual(self.calls, [("full", "360")])
+
+    def test_falls_back_to_the_full_lookup(self):
+        def boom(vid, meta, res):
+            raise RuntimeError("no")
+        self.d.fetch_dash = boom
+        self.d.resolve_short("abc", {}, quality="1080")
+        self.assertEqual(self.calls, [("full", "1080")])
+
+
+class ShortsTests(unittest.TestCase):
+    class Dlp:
+        def __init__(self):
+            self.calls = []
+
+        def _json(self, *args):
+            self.calls.append(args)
+            url = args[-1]
+            if "/shorts" in url:
+                cid = url.split("/channel/")[1].split("/")[0]
+                return {"channel": "Chan " + cid, "entries": [{"id": f"{cid[:8]}{i:03d}"[:11].ljust(11, "x"), "title": f"short {i}", "duration": 30} for i in range(3)]}
+            return {}
+
+        def search(self, query, n=24):
+            self.calls.append(("search", query, n))
+            return [{"id": "aaaaaaaaaaa", "title": "short", "dur": 30.0, "live": False},
+                    {"id": "bbbbbbbbbbb", "title": "long video", "dur": 900.0, "live": False},
+                    {"id": "ccccccccccc", "title": "no length", "dur": 0.0, "live": False},
+                    {"id": "ddddddddddd", "title": "live", "dur": 0.0, "live": True}]
+
+    def test_channel_shorts_reads_the_shorts_tab(self):
+        d = self.Dlp()
+        got = shorts.channel_shorts(d, "UCabc12345", 5)
+        self.assertEqual(len(got), 3)
+        self.assertTrue(all(v["short"] and v["channelId"] == "UCabc12345" and v["channel"] == "Chan UCabc12345" for v in got))
+        self.assertTrue(d.calls[0][-1].endswith("/channel/UCabc12345/shorts"))
+        self.assertIn("5", d.calls[0])
+
+    def test_search_keeps_only_short_enough_results(self):
+        d = self.Dlp()
+        got = shorts.search_shorts(d, "cats", 10)
+        self.assertEqual([v["id"] for v in got], ["aaaaaaaaaaa", "ccccccccccc"])        # not the 15-minute one, not the live one
+        self.assertEqual(d.calls[0][1], "cats #shorts")
+
+    def test_subscription_shorts_weaves_channels_and_survives_a_failing_one(self):
+        d = self.Dlp()
+        subs = [{"id": f"UC{n}xxxxxxxx", "name": n} for n in "ABC"]
+        real = d._json
+
+        def flaky(*args):
+            if "UCBxxxxxxxx" in args[-1]:
+                raise RuntimeError("blocked")
+            return real(*args)
+        d._json = flaky
+        got = shorts.subscription_shorts(d, subs, per=3, channels=3, rng=random.Random(1))
+        self.assertEqual(len(got), 6)                                                    # two working channels, three each
+        self.assertEqual({v["channelId"] for v in got}, {"UCAxxxxxxxx", "UCCxxxxxxxx"})
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel>
+  <title>The Test Show</title>
+  <itunes:author>Some Host</itunes:author>
+  <description>&lt;p&gt;A show &amp;amp; more&lt;/p&gt;</description>
+  <itunes:image href="https://img.example/cover.jpg"/>
+  <item><title>Old one</title><guid>g-1</guid><pubDate>Mon, 01 Jan 2024 10:00:00 +0000</pubDate>
+    <enclosure url="https://cdn.example/1.mp3" type="audio/mpeg" length="100"/><itunes:duration>45:30</itunes:duration></item>
+  <item><title>New one</title><guid>g-2</guid><pubDate>Mon, 01 Jul 2024 10:00:00 +0000</pubDate>
+    <enclosure url="https://cdn.example/2.mp3" type="audio/mpeg" length="100"/><itunes:duration>1:02:03</itunes:duration>
+    <itunes:episode>2</itunes:episode><itunes:season>1</itunes:season>
+    <content:encoded><![CDATA[<p>Notes<br/>line two</p>]]></content:encoded></item>
+  <item><title>A video</title><guid>g-3</guid><enclosure url="https://cdn.example/3.mp4" type="video/mp4" length="1"/></item>
+  <item><title>No file</title><guid>g-4</guid></item>
+</channel></rss>"""
+
+
+class PodcastTests(unittest.TestCase):
+    def test_parse_feed(self):
+        f = podcasts.parse_feed(FEED, "https://x.example/feed.xml")
+        self.assertEqual((f["title"], f["author"], f["image"]), ("The Test Show", "Some Host", "https://img.example/cover.jpg"))
+        self.assertEqual(f["desc"], "A show & more")
+        self.assertEqual([e["title"] for e in f["episodes"]], ["New one", "Old one"])     # newest first; video and file-less items left out
+        new = f["episodes"][0]
+        self.assertEqual((new["dur"], new["episode"], new["season"]), (3723.0, 2, 1))
+        self.assertEqual(new["desc"], "Notes\nline two")
+        self.assertEqual(f["episodes"][1]["dur"], 2730.0)
+        self.assertEqual(len({e["key"] for e in f["episodes"]}), 2)
+
+    def test_not_a_feed(self):
+        for bad in (b"<html><body>hi</body></html>", b"not xml at all", b"<feed xmlns='http://www.w3.org/2005/Atom'></feed>",
+                    b'<!DOCTYPE x [<!ENTITY a "aaaa">]><rss><channel/></rss>'):
+            with self.assertRaises(podcasts.FeedError):
+                podcasts.parse_feed(bad, "u")
+
+    def test_durations(self):
+        self.assertEqual([podcasts.parse_duration(x) for x in ("90", "1:30", "1:01:30", "", "abc")], [90.0, 90.0, 3690.0, 0.0, 0.0])
+
+    def test_what_was_typed(self):
+        self.assertEqual(podcasts.classify("history of rome"), ("search", "history of rome"))
+        self.assertEqual(podcasts.classify("https://x.example/feed.xml"), ("feed", "https://x.example/feed.xml"))
+        self.assertEqual(podcasts.classify("feed://x.example/rss"), ("feed", "https://x.example/rss"))
+        self.assertEqual(podcasts.classify("x.example/rss")[0], "feed")
+        self.assertEqual(podcasts.classify("https://podcasts.apple.com/us/podcast/x/id123")[0], "apple")
+        self.assertEqual(podcasts.classify("")[0], "search")
+
+    def test_search_keeps_results_with_a_feed(self):
+        body = json.dumps({"results": [{"collectionName": "A", "artistName": "Me", "feedUrl": "https://a/feed", "artworkUrl600": "https://a/i.jpg"},
+                                       {"collectionName": "No feed"}]}).encode()
+        old = podcasts.net.get
+        podcasts.net.get = lambda url, timeout=10.0: body
+        try:
+            self.assertEqual(podcasts.search("x"), [{"title": "A", "author": "Me", "feed": "https://a/feed", "image": "https://a/i.jpg", "genre": ""}])
+        finally:
+            podcasts.net.get = old
+
+    def test_apple_link(self):
+        old = podcasts.net.get
+        podcasts.net.get = lambda url, timeout=10.0: json.dumps({"results": [{"feedUrl": "https://feed/x"}]}).encode()
+        try:
+            self.assertEqual(podcasts.feed_from_apple("https://podcasts.apple.com/us/podcast/name/id1234"), "https://feed/x")
+            with self.assertRaises(podcasts.FeedError):
+                podcasts.feed_from_apple("https://podcasts.apple.com/us/podcast/name")
+        finally:
+            podcasts.net.get = old
+
+    def test_only_web_addresses_are_fetched(self):
+        for bad in ("file:///etc/passwd", "ftp://x/y", "javascript:1"):
+            with self.assertRaises(podcasts.FeedError):
+                podcasts.fetch(bad)
+
+    def test_store_keeps_subscriptions_and_places(self):
+        with tempfile.TemporaryDirectory() as d:
+            mk = lambda: podcasts.Store(Path(d) / "p.json", Path(d) / "cache")
+            st = mk()
+            feed = podcasts.parse_feed(FEED, "https://x.example/feed.xml")
+            st.subscribe(feed)
+            st.subscribe(feed)                                          # again: still one
+            a, b = feed["episodes"][0]["key"], feed["episodes"][1]["key"]
+            st.set_position(a, 1000, 3723)
+            st.set_position(a, 2, 3723)                                 # a restart must not wipe the saved place
+            st.set_position(b, 2700, 2730)                              # nearly done: counts as heard
+            again = mk()
+            self.assertEqual(len(again.subs), 1)
+            self.assertEqual(again.position(a), 1000.0)
+            self.assertTrue(again.is_played(b))
+            self.assertEqual(again.position(b), 0.0)
+            self.assertEqual(again.unplayed(again.cached_feed(feed["url"])), 1)
+            again.mark_played(b, False)
+            self.assertEqual(again.unplayed(again.cached_feed(feed["url"])), 2)
+            again.unsubscribe(feed["url"])
+            self.assertEqual(mk().subs, [])
+            self.assertIsNone(mk().cached_feed(feed["url"]))
+
+
+MASTER = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,CODECS="avc1.4d401e,mp4a.40.2"
+low/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
+https://cdn.example/hd/index.m3u8?token=abc
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720
+/mid/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=900000
+audio-ish.m3u8
+"""
+
+
+class HlsTests(unittest.TestCase):
+    def test_master_playlist_biggest_first(self):
+        vs = hls.parse_master(MASTER, "https://tv.example/live/master.m3u8")
+        self.assertEqual([v["height"] for v in vs], [1080, 720, 480, 0])
+        self.assertEqual(vs[0]["url"], "https://cdn.example/hd/index.m3u8?token=abc")
+        self.assertEqual(vs[1]["url"], "https://tv.example/mid/index.m3u8")                   # relative to the host
+        self.assertEqual(vs[2]["url"], "https://tv.example/live/low/index.m3u8")              # relative to the folder
+        self.assertEqual(vs[0]["bandwidth"], 6_000_000)
+        self.assertIn("1920x1080 @ 6.0 Mbps", hls.describe(vs))
+
+    def test_a_plain_media_playlist_has_no_variants(self):
+        self.assertEqual(hls.parse_master("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg1.ts\n", "https://x/y.m3u8"), [])
+
+    def test_only_web_addresses(self):
+        self.assertEqual(hls.variants("file:///etc/passwd"), [])
+        self.assertEqual(hls.variants("rtmp://x/y"), [])
+
+
+class TwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = twitch.Store(Path(self.tmp.name) / "twitch.json")
+        self.store.client_id = "cid"
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def client(self, script):
+        def fake(method, url, headers=None, form=None, timeout=15.0):
+            self.calls.append((method, url, form))
+            for key, reply in script:
+                if key in url and (reply.get("when") is None or reply["when"](form, headers)):
+                    return reply["status"], reply["body"]
+            return 404, {"message": "no such thing"}
+        return twitch.Twitch(self.store, fake)
+
+    def test_login_flow(self):
+        tw = self.client([
+            ("/device", {"status": 200, "body": {"device_code": "dc", "user_code": "ABCDEFGH", "verification_uri": "https://www.twitch.tv/activate", "interval": 5, "expires_in": 600}}),
+        ])
+        login = tw.start_login()
+        self.assertEqual((login["user_code"], login["url"]), ("ABCDEFGH", "https://www.twitch.tv/activate"))
+        self.assertEqual(self.calls[0][2]["scopes"], "user:read:follows")
+        waiting = self.client([("/token", {"status": 400, "body": {"message": "authorization_pending"}})])
+        self.assertFalse(waiting.poll_login(login))
+        done = self.client([("/token", {"status": 200, "body": {"access_token": "AT", "refresh_token": "RT", "expires_in": 14000}}),
+                            ("/users", {"status": 200, "body": {"data": [{"id": "7", "login": "me", "display_name": "Me", "profile_image_url": "i"}]}})])
+        self.assertTrue(done.poll_login(login))
+        again = twitch.Store(self.store.path)
+        self.assertTrue(again.signed_in)
+        self.assertEqual((again.user["login"], again.refresh), ("me", "RT"))
+        self.assertEqual(oct(self.store.path.stat().st_mode & 0o777), "0o600")           # a login token: private to you
+
+    def test_login_needs_a_client_id_and_reports_refusal(self):
+        self.store.client_id = ""
+        with self.assertRaises(twitch.TwitchError):
+            self.client([]).start_login()
+        self.store.client_id = "cid"
+        bad = self.client([("/device", {"status": 400, "body": {"message": "invalid client"}})])
+        with self.assertRaisesRegex(twitch.TwitchError, "invalid client"):
+            bad.start_login()
+        denied = self.client([("/token", {"status": 400, "body": {"message": "access_denied"}})])
+        with self.assertRaises(twitch.TwitchError):
+            denied.poll_login({"device_code": "x"})
+
+    def signed(self):
+        self.store.access, self.store.refresh, self.store.expires = "AT", "RT", time.time() + 3000
+        self.store.user = {"id": "7", "login": "me", "name": "Me", "image": ""}
+
+    def test_following_pages_and_pictures(self):
+        self.signed()
+        pages = iter([{"data": [{"broadcaster_id": "1", "broadcaster_login": "zed", "broadcaster_name": "Zed"}], "pagination": {"cursor": "c2"}},
+                      {"data": [{"broadcaster_id": "2", "broadcaster_login": "amy", "broadcaster_name": "Amy"}], "pagination": {}}])
+
+        def fake(method, url, headers=None, form=None, timeout=15.0):
+            self.assertEqual(headers["Client-Id"], "cid")
+            if "channels/followed" in url:
+                return 200, next(pages)
+            if "/users" in url:
+                return 200, {"data": [{"id": "1", "profile_image_url": "z.png"}, {"id": "2", "profile_image_url": "a.png"}]}
+            return 404, {}
+        out = twitch.Twitch(self.store, fake).following()
+        self.assertEqual([(c["name"], c["image"]) for c in out], [("Amy", "a.png"), ("Zed", "z.png")])
+
+    def test_live_most_viewers_first(self):
+        self.signed()
+        body = {"data": [{"user_login": "a", "user_name": "A", "title": "t", "game_name": "g", "viewer_count": 5, "type": "live", "thumbnail_url": "x-{width}x{height}.jpg"},
+                         {"user_login": "b", "user_name": "B", "viewer_count": 50, "type": "live", "thumbnail_url": ""}], "pagination": {}}
+        out = twitch.Twitch(self.store, lambda *a, **k: (200, body)).live()
+        self.assertEqual([s["login"] for s in out], ["b", "a"])
+        self.assertEqual(out[1]["thumb"], "x-440x248.jpg")
+
+    def test_an_expired_token_is_refreshed_once(self):
+        self.signed()
+        seen = []
+
+        def fake(method, url, headers=None, form=None, timeout=15.0):
+            seen.append(url.split("?")[0].rsplit("/", 1)[-1])
+            if url.endswith("/token"):
+                return 200, {"access_token": "NEW", "refresh_token": "RT2", "expires_in": 3600}
+            return (401, {"message": "Invalid OAuth token"}) if headers["Authorization"] == "Bearer AT" else (200, {"data": [], "pagination": {}})
+        self.assertEqual(twitch.Twitch(self.store, fake).live(), [])
+        self.assertEqual((self.store.access, self.store.refresh), ("NEW", "RT2"))
+        self.assertEqual(seen, ["followed", "token", "followed"])
+
+    def test_channel_names(self):
+        for text, want in (("Shroud", "shroud"), ("https://www.twitch.tv/Shroud?sr=a", "shroud"), ("twitch.tv/some_one/videos", "some_one"),
+                           ("a b", ""), ("ab", ""), ("https://example.com/x", "")):
+            self.assertEqual(twitch.channel_login(text), want)
+
+    def test_format_choice(self):
+        fm = [{"url": "u1", "height": 1080, "fps": 60, "vcodec": "avc1", "acodec": "mp4a"}, {"url": "u2", "height": 720, "fps": 60, "vcodec": "avc1", "acodec": "mp4a"},
+              {"url": "u3", "height": 480, "vcodec": "avc1", "acodec": "mp4a"}, {"url": "ua", "vcodec": "none", "acodec": "mp4a"}]
+        self.assertEqual(twitch.pick_format(fm)["url"], "u1")
+        self.assertEqual(twitch.pick_format(fm, "720")["url"], "u2")
+        self.assertEqual(twitch.pick_format(fm, "360")["url"], "u3")          # nothing that small: the smallest there is
+        self.assertIsNone(twitch.pick_format([fm[3]]))
+
+    def stream(self, height=1080):
+        return {"title": "T", "formats": [{"url": f"https://v/{height}.m3u8", "height": height, "vcodec": "avc1", "acodec": "mp4a"}]}
+
+    def test_resolve_normally(self):
+        got = twitch.resolve("yt-dlp", "chan", self.store, run=lambda args, t: self.stream())
+        self.assertEqual((got["height"], got["adfree"], got["note"]), (1080, False, ""))
+
+    def test_ad_free_uses_the_proxy(self):
+        self.store.adfree, self.store.proxy = True, "http://proxy.example:3128"
+        seen = []
+        got = twitch.resolve("yt-dlp", "chan", self.store, run=lambda args, t: (seen.append(args), self.stream())[1])
+        self.assertIn("--proxy", seen[0])
+        self.assertTrue(got["adfree"])
+        self.assertEqual(len(seen), 1)
+
+    def test_ad_free_falls_back_to_the_normal_stream(self):
+        self.store.adfree, self.store.proxy = True, "http://proxy.example:3128"
+        seen = []
+
+        def run(args, t):
+            seen.append(args)
+            if "--proxy" in args:
+                raise twitch.TwitchError("Twitch took too long to answer.")
+            return self.stream(720)
+        got = twitch.resolve("yt-dlp", "chan", self.store, run=run)
+        self.assertEqual((got["height"], got["adfree"]), (720, False))
+        self.assertIn("with ads", got["note"])
+        self.assertEqual(len(seen), 2)
+
+    def test_playlist_summary_shows_tags_not_addresses(self):
+        text = ("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:100\n"
+                '#EXT-X-DATERANGE:ID="stitched-ad-1",CLASS="twitch-stitched-ad",DURATION=30.0,X-TV-TWITCH-AD-URL="https://ads.example/a?token=SECRET"\n'
+                "#EXT-X-PROGRAM-DATE-TIME:2026-11-19T08:00:00.000Z\n#EXTINF:2.000,\nhttps://cdn.example/seg1.mp4?dna=SECRET\n"
+                "#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2026-11-19T08:00:30.000Z\n#EXTINF:2.000,\nhttps://cdn.example/seg2.mp4\n")
+        out = twitch.playlist_summary("u", fetch=lambda u: text)
+        self.assertIn("2 segments, 1 discontinuities", out[0])
+        self.assertIn("first time 2026-11-19T08:00:00.000Z", out[0])
+        joined = "\n".join(out)
+        self.assertIn("twitch-stitched-ad", joined)
+        self.assertNotIn("SECRET", joined)
+        self.assertNotIn("cdn.example", joined)
+        self.assertIn("unreadable", twitch.playlist_summary("u", fetch=lambda u: 1 / 0)[0])
+
+    def test_ad_free_without_a_proxy_says_so(self):
+        self.store.adfree = True
+        got = twitch.resolve("yt-dlp", "chan", self.store, run=lambda a, t: self.stream())
+        self.assertIn("no proxy address", got["note"])
+
+    def test_offline_is_reported_not_retried(self):
+        self.store.adfree, self.store.proxy = True, "http://p:1"
+        calls = []
+
+        def run(args, t):
+            calls.append(args)
+            raise twitch.TwitchError("That channel is offline right now.")
+        with self.assertRaisesRegex(twitch.TwitchError, "offline"):
+            twitch.resolve("yt-dlp", "chan", self.store, run=run)
+        self.assertEqual(len(calls), 1)
+
+
+class TwitchSplitTests(unittest.TestCase):
+    TXT = """#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DATERANGE:ID="a",CLASS="twitch-stitched-ad",START-DATE="2026-11-18T19:15:16.044Z",DURATION=10.0
+#EXT-X-MAP:URI="http://x/adinit"
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T19:15:16.044Z
+#EXTINF:2.000,
+http://x/a1
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="http://x/liveinit"
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T19:15:26.044Z
+#EXTINF:2.000,
+http://x/l1
+"""
+
+    def test_split(self):
+        from marquee.core import twitch as tw
+        cut = tw.ad_end(self.TXT)
+        self.assertIsNotNone(cut)
+        before, after = tw.split_at(self.TXT, "http://x/", cut)
+        self.assertIn("a1", before)
+        self.assertIn("#EXT-X-ENDLIST", before)
+        self.assertNotIn("l1", before)
+        self.assertIn("l1", after)
+        self.assertIn("liveinit", after)
+        self.assertNotIn("a1", after)
+        self.assertNotIn("ENDLIST", after)
+
+    def test_no_break(self):
+        from marquee.core import twitch as tw
+        self.assertIsNone(tw.ad_end("#EXTM3U\n#EXTINF:2,\nhttp://x/s\n"))
+
+
+    def test_break_tail_stays_with_the_break(self):
+        from marquee.core import twitch as tw
+        txt = """#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DATERANGE:ID="a",CLASS="twitch-stitched-ad",START-DATE="2026-11-18T19:30:22.044Z",DURATION=30.235
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T19:30:50.044Z
+#EXTINF:2.000,
+http://x/a14
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T19:30:52.044Z
+#EXTINF:0.235,
+http://x/tail
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T19:30:52.279Z
+#EXTINF:2.000,
+http://x/live1
+"""
+        before, after = tw.split_at(txt, "http://x/", tw.ad_end(txt))
+        self.assertIn("tail", before)
+        self.assertNotIn("tail", after)
+        self.assertIn("live1", after)
+
+
+    def test_cut_at_zero_keeps_everything(self):
+        from marquee.core import twitch as tw
+        txt = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-PROGRAM-DATE-TIME:2026-11-19T00:00:00.000Z\n#EXTINF:2.000,\nhttp://x/a\n#EXTINF:2.000,\nhttp://x/b\n"
+        before, after = tw.split_at(txt, "http://x/", 0.0)
+        self.assertNotIn("http://x/a", before)
+        self.assertIn("http://x/a", after)
+        self.assertIn("http://x/b", after)
+        self.assertIn("MEDIA-SEQUENCE:7", after)
+
+
+class TwitchAdStateTests(unittest.TestCase):
+    @staticmethod
+    def pl(segs, ads=()):
+        out = ["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:0"]
+        for s, d in ads:
+            out.append(f'#EXT-X-DATERANGE:ID="a",CLASS="twitch-stitched-ad",START-DATE="{s}",DURATION={d}')
+        for t, u in segs:
+            out += ["#EXT-X-PROGRAM-DATE-TIME:" + t, "#EXTINF:2.0,", u]
+        return "\n".join(out) + "\n"
+
+    def test_break_listed_mid_stream(self):
+        from marquee.core import twitch as tw
+        ch = [("2026-01-01T00:00:%02d.000Z" % (i * 2), "c%d.ts" % i) for i in range(5)]
+        ad = [("2026-01-01T00:00:%02d.000Z" % (10 + i * 2), "a%d.ts" % i) for i in range(3)]
+        after = [("2026-01-01T00:00:%02d.000Z" % (16 + i * 2), "d%d.ts" % i) for i in range(2)]
+        win = [("2026-01-01T00:00:10.000Z", 6)]
+        st = tw.AdState()
+        self.assertFalse(st.open(self.pl(ch), "http://x/"))
+        text = self.pl(ch + ad, win)
+        main, n, _ = st.main(text, "http://x/")
+        self.assertEqual(n, 5)
+        self.assertIn("#EXT-X-ENDLIST", main)                 # the channel stops where the break begins
+        self.assertNotIn("a0.ts", main)
+        self.assertTrue(st.pending())
+        text = self.pl(ch + ad + after, win)
+        adtxt, n, _ = st.ad_part(text, "http://x/")
+        self.assertEqual(n, 3)
+        self.assertIn("a2.ts", adtxt)
+        self.assertNotIn("d0.ts", adtxt)
+        st.advance()
+        main, n, _ = st.main(text, "http://x/")
+        self.assertEqual(n, 2)
+        self.assertIn("d0.ts", main)
+        self.assertNotIn("#EXT-X-ENDLIST", main)
+        self.assertFalse(st.pending())

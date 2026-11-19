@@ -13,11 +13,14 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 
 ## Highlights
 
-- **Library:** Movies, TV Shows, Music, Podcasts, Home Videos and Audiobooks, with cover art looked up online.
+- **Library:** Movies, TV Shows, Music and Podcasts, with cover art looked up online.
 - **YouTube without an account:** search, channels, playlists, subscriptions (Google Takeout import), history,
   quality menu with Auto, resume where you left off, fast start.
 - **YouTube Music:** search songs, albums, artists and playlists with no account. Album and artist pages look like the Music tab, and songs play in the same mini player with lyrics and media keys. Needs the `requests` Python package.
-- **Live TV:** M3U playlists with an XMLTV guide.
+- **YouTube Shorts:** a vertical feed with auto-scroll, a "For you" mix built from your subscriptions and (if you sign in with a browser) YouTube's own recommendations, and a "More like this" button.
+- **Podcasts:** search, subscribe by name, RSS link or Apple Podcasts link, resume where you stopped, and playback speed. Playback carries on while you browse.
+- **Twitch:** sign in with a code, see which followed channels are live, and watch them at the size you pick. Needs your own free Twitch developer Client ID. An optional ad-free switch uses a proxy address you provide. If it fails, the normal stream is used. A commercial break at the start of a channel plays in full and then the channel starts.
+- **Live TV:** M3U playlists with an XMLTV guide. Picks the largest picture size the stream offers.
 - **Music:** artist pages, lyrics, visualiser, background mini player.
 - **Subtitles:** automatic sync and download from OpenSubtitles, with Subdl as an optional backup.
 - **SponsorBlock:** skips sponsor reads and similar parts of YouTube videos, and you choose which kinds.
@@ -54,10 +57,10 @@ Run with `python3 -m marquee`, or `pip install .[qt]`. `bash install-desktop.sh`
 
 ## Library features
 
-Media (Movies, TV Shows, Music, Podcasts, Home Videos, Audiobooks), Library / Continue / Favorites tabs,
+Media (Movies, TV Shows, Music, Podcasts), Library / Continue / Favorites tabs,
 search, grid and list views, adjustable cover size, drag and drop, folder import, file name
 parsing (`Movie.1999.1080p.mkv`, `Show.S01E02.mkv`, `Artist - Song.mp3`), MP3 tags and embedded covers, cover
-art lookup (iTunes Search API for movies, music, podcasts and audiobooks; TVmaze for TV), manual cover choice, resume where you stopped (videos only; songs always start from the top), queue with next/previous, and
+art lookup (iTunes Search API for movies, music and podcasts; TVmaze for TV), manual cover choice, resume where you stopped (videos only; songs always start from the top), queue with next/previous, and
 subtitles, and three built-in sample tracks so the player works on first launch.
 
 **Media keys:** the keyboard's play/pause, next and previous keys, and your desktop's media widget, control Marquee through MPRIS. They act on the video or channel on screen, otherwise on the music player.
@@ -225,6 +228,10 @@ kept, so even a huge national guide stays small.
   and guide are refreshed when older than a day / twelve hours, or with **Refresh Channels and Guide**.
 - Playlists and favourites are in `~/.local/share/marquee/iptv.json`; the cache is in `~/.cache/marquee/iptv/`.
 - Xtream Codes logins are not supported; use the M3U link your provider gives you instead.
+
+## Log file
+
+Marquee keeps a copy of everything it prints in `~/.local/share/marquee/marquee.log` (the previous run is kept as `marquee.log.1`). If something misbehaves, attach that file to a bug report.
 
 ## KDE: blur and the WhiteSur theme
 

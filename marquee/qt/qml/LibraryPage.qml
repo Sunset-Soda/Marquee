@@ -173,7 +173,7 @@ Kirigami.Page {
         QQC2.MenuItem {
             text: itemMenu.isShow ? "Find Episode Names and Artwork" : "Find Cover Art"
             icon.name: "search"
-            visible: itemMenu.isShow || (page.menuItem || ({})).kind === "movie" || (page.menuItem || ({})).kind === "music" || (page.menuItem || ({})).kind === "podcast" || (page.menuItem || ({})).kind === "book"
+            visible: itemMenu.isShow || (page.menuItem || ({})).kind === "movie" || (page.menuItem || ({})).kind === "music" || (page.menuItem || ({})).kind === "podcast"
             height: visible ? implicitHeight : 0
             onTriggered: marquee.findCover(page.menuId)
         }

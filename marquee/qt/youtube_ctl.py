@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
@@ -18,6 +19,8 @@ class YoutubeController(QObject):
     _progress = Signal(str)
     imported = Signal(int, int)         # channels added, channels already subscribed
     ready = Signal(str)                 # a video's stream address is known: play "yt:<id>"
+    shortReady = Signal(str)            # the same for a Short, which plays inside the Shorts page instead
+    shortFailed = Signal(str, str)      # a Short's id and why it could not be opened
     _done = Signal(str, object)
     _failed = Signal(str, str)
 
@@ -46,6 +49,10 @@ class YoutubeController(QObject):
         self._playlist: dict = {}
         self._queue: list[str] = []                 # video ids that play one after another (a playlist)
         self._known: dict[str, dict] = {}
+        self._shorts: set[str] = set()              # ids being opened for the Shorts page (waiting or running)
+        self._short_run: set[str] = set()           # ... the ones being fetched right now
+        self._short_queue: list[tuple[str, dict]] = []   # ... and those waiting for a turn
+        self._short_files: dict[str, str] = {}      # the file each fetched Short plays from
         self._busy: set[str] = set()
         self._latest: dict[str, int] = {}
         self._error = ""
@@ -133,6 +140,13 @@ class YoutubeController(QObject):
 
     def _on_failed(self, key: str, msg: str):
         _log(f"{key}: {msg}")
+        if key.startswith("play:") and key[5:] in self._shorts:
+            self._shorts.discard(key[5:])
+            self._short_run.discard(key[5:])
+            self._busy.discard(key)
+            self.shortFailed.emit(key[5:], msg)
+            self._pump_shorts()
+            return
         self._note = ""
         self._busy.discard(key)
         self._error = msg
@@ -560,6 +574,58 @@ class YoutubeController(QObject):
             video_id, quality=quality, speed=speed, fast=fast,
             on_upgrade=lambda up: self._beginUpgrade.emit(video_id, up)))
 
+    SHORTS_AT_ONCE = 2                                  # Shorts fetched in the background at the same time
+    SHORTS_KEEP = 8                                     # fetched Shorts kept on disk: the one playing, the last, and those coming
+
+    @Slot(str, "QVariantMap")
+    def playShort(self, video_id: str, known=None):
+        """Get a Short's stream for the Shorts page, at the quality chosen for YouTube, right now; it says shortReady when done."""
+        self._want_short(video_id, known or {}, now=True)
+
+    @Slot(str, "QVariantMap")
+    def prefetchShort(self, video_id: str, known=None):
+        """Start getting a Short that is coming up, a couple at a time, so it is ready when you move on to it."""
+        self._want_short(video_id, known or {}, now=False)
+
+    @Slot()
+    def dropShortQueue(self):
+        """Forget the Shorts waiting their turn (you jumped somewhere else); those already being fetched carry on."""
+        for vid, _ in self._short_queue:
+            self._shorts.discard(vid)
+        self._short_queue = []
+
+    def _short_ready(self, video_id: str) -> bool:
+        info = self._c.yt_info.get(f"yt:{video_id}")
+        path = self._short_files.get(video_id, "")
+        return bool(info) and (not path or Path(path).exists())
+
+    def _want_short(self, video_id: str, known: dict, now: bool):
+        if self._short_ready(video_id):
+            if now:
+                self.shortReady.emit(video_id)
+            return
+        self._c.yt_info.pop(f"yt:{video_id}", None)             # its file is gone: fetch it again
+        if video_id in self._short_run:
+            return                                              # already on its way; shortReady comes when it lands
+        self._short_queue = [q for q in self._short_queue if q[0] != video_id]
+        self._shorts.add(video_id)
+        if now:
+            self._start_short(video_id, known)
+        else:
+            self._short_queue.append((video_id, known))
+            self._pump_shorts()
+
+    def _pump_shorts(self):
+        while self._short_queue and len(self._short_run) < self.SHORTS_AT_ONCE:
+            vid, known = self._short_queue.pop(0)
+            self._start_short(vid, known)
+
+    def _start_short(self, video_id: str, known: dict):
+        self._short_run.add(video_id)
+        quality, speed = self._store.quality, self._store.speed
+        self._dlp.keep = max(self._store.keep_count, self.SHORTS_KEEP)
+        self._job(f"play:{video_id}", lambda: self._dlp.resolve_short(video_id, dict(known), quality=quality, speed=speed))
+
     @Slot(str, float, str)
     def reopen(self, video_id: str, seconds: float, quality: str):
         """Play the same video again at another quality, from where you were."""
@@ -583,7 +649,10 @@ class YoutubeController(QObject):
             old = self._store.speed
             self._store.set_speed(0.5 * old + 0.5 * info["speed"] if old else info["speed"])
         known = self._known.get(vid, {})
-        self._current_file = info.get("file", "")
+        if vid not in self._shorts:
+            self._current_file = info.get("file", "")
+        else:
+            self._short_files[vid] = info.get("file", "")
         up = info.get("upgrade")
         if up:
             self._start_upgrade(vid, up)
@@ -596,5 +665,11 @@ class YoutubeController(QObject):
         row = dict(known) if known else {"id": vid}
         row.update({"id": vid, "title": info["title"] or row.get("title", ""), "channel": info["channel"] or row.get("channel", ""),
                     "thumb": row.get("thumb") or info["thumb"], "dur": info["dur"] or row.get("dur", 0)})
+        if vid in self._shorts:                         # opened by the Shorts page: it plays it itself, and history isn't touched
+            self._shorts.discard(vid)
+            self._short_run.discard(vid)
+            self.shortReady.emit(vid)
+            self._pump_shorts()
+            return
         self._store.watched(row)
         self.ready.emit(f"yt:{vid}")

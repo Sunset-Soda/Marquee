@@ -75,13 +75,52 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):                            # the player closed the connection
             pass
 
+    def _serve_hls(self, head: bool, url: str, part: str, state):
+        """The channel ("main") or the commercial break ("ad") of a live playlist, read fresh each time the player asks (see core.twitch.AdState)."""
+        import sys
+        import time
+        from . import twitch
+        deadline = time.time() + 20
+        while True:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": twitch.UA})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    text = r.read(600_000).decode("utf-8", "replace")
+                body, n, beyond = state.ad_part(text, url) if part == "ad" else state.main(text, url)
+            except Exception:
+                self.send_error(502)
+                return
+            w = state.ad
+            if part == "main" and w and getattr(state, "logged", None) != w:
+                state.logged = w                                    # type: ignore[attr-defined]
+                print(f"marquee: twitch: commercial break listed: {time.strftime('%H:%M:%S', time.gmtime(w[0]))}Z for {w[1] - w[0]:.0f}s", file=sys.stderr, flush=True)
+            # the channel's pieces appear a little after a break's own time is up: wait for them rather than hand the player an empty list
+            if n or beyond or time.time() > deadline or part == "ad":
+                break
+            print(f"marquee: twitch: waiting for the {part}: no pieces yet", file=sys.stderr, flush=True)
+            time.sleep(1)
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if not head:
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+
     def _serve(self, head: bool):
-        entry = self.server.entries.get(self.path.strip("/"))     # type: ignore[attr-defined]
+        entry = self.server.entries.get(self.path.split("?")[0].strip("/"))     # type: ignore[attr-defined]
         if not entry:
             self.send_error(404)
             return
         if entry[0] == "file":
             self._serve_file(head, entry[1], entry[2], entry[3])
+            return
+        if entry[0] == "hls":
+            self._serve_hls(head, entry[1], entry[2], entry[3])
             return
         _, url, headers = entry
         chunk = getattr(self.server, "chunk", CHUNK)
@@ -191,6 +230,14 @@ class StreamProxy:
         self._n += 1
         token = f"s{self._n}"
         s.entries[token] = ("file", path, size, proc)            # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}"
+
+    def add_hls(self, url: str, part: str, state) -> str:
+        """The local address of the channel ("main") or the current commercial break ("ad") of a live playlist; `state` is a core.twitch.AdState."""
+        s = self._start()
+        self._n += 1
+        token = f"s{self._n}"
+        s.entries[token] = ("hls", url, part, state)               # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}"
 
     def stop(self) -> None:
