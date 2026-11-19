@@ -65,6 +65,7 @@ class Store:
         self.proxy = ""                           # address of the proxy it uses
         self.browser_login = False                # let yt-dlp use the browser's Twitch login (Turbo / subscriptions)
         self.quality = "best"                     # "best" or a height such as "720"
+        self.list_view = False                    # show channels as a list instead of tiles
         self._load()
 
     def _load(self):
@@ -78,13 +79,14 @@ class Store:
         self.user = dict(d.get("user") or {})
         self.adfree = bool(d.get("adfree"))
         self.browser_login = bool(d.get("browser_login"))
+        self.list_view = bool(d.get("list_view"))
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         payload = {"client_id": self.client_id, "access": self.access, "refresh": self.refresh, "expires": self.expires,
                    "user": self.user, "adfree": self.adfree, "proxy": self.proxy, "browser_login": self.browser_login,
-                   "quality": self.quality}
+                   "quality": self.quality, "list_view": self.list_view}
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # private from the first byte
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False))

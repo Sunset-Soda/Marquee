@@ -281,6 +281,12 @@ Kirigami.Page {
                 QQC2.ToolTip.text: "Refresh who is live"; QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
+                visible: twitch.signedIn
+                icon.name: twitch.listView ? "view-list-icons" : "view-list-details"
+                onClicked: twitch.setListView(!twitch.listView)
+                QQC2.ToolTip.text: twitch.listView ? "Show as tiles" : "Show as a list"; QQC2.ToolTip.visible: hovered
+            }
+            QQC2.ToolButton {
                 icon.name: "configure"
                 checkable: true
                 checked: pg.showSettings
@@ -415,29 +421,41 @@ Kirigami.Page {
             contentHeight: body.implicitHeight + Kirigami.Units.largeSpacing * 2
             QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
 
+            // what the search box leaves in
+            readonly property string needle: filterField.text.trim().toLowerCase()
             ColumnLayout {
                 id: body
+                readonly property var liveShown: twitch.live.filter(function (c) { return scroller.needle === "" || c.name.toLowerCase().indexOf(scroller.needle) >= 0 || c.login.indexOf(scroller.needle) >= 0 || (c.game || "").toLowerCase().indexOf(scroller.needle) >= 0 })
+                readonly property var offlineShown: twitch.offline.filter(function (c) { return scroller.needle === "" || c.name.toLowerCase().indexOf(scroller.needle) >= 0 || c.login.indexOf(scroller.needle) >= 0 })
                 x: Kirigami.Units.smallSpacing
                 y: Kirigami.Units.smallSpacing
                 width: scroller.width - Kirigami.Units.smallSpacing * 2
                 spacing: Kirigami.Units.largeSpacing
 
+                QQC2.TextField {
+                    id: filterField
+                    Layout.fillWidth: true
+                    placeholderText: "Search the channels you follow (" + (twitch.live.length + twitch.offline.length) + ")"
+                    visible: twitch.live.length + twitch.offline.length > 8
+                }
                 RowLayout {
                     spacing: Kirigami.Units.smallSpacing
                     QQC2.Label { text: "Live now"; font.bold: true; font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2 }
-                    QQC2.Label { text: twitch.live.length > 0 ? "(" + twitch.live.length + ")" : ""; opacity: 0.6 }
+                    QQC2.Label { text: body.liveShown.length > 0 ? "(" + body.liveShown.length + ")" : ""; opacity: 0.6 }
                     QQC2.BusyIndicator { running: twitch.busy; visible: running; implicitWidth: Kirigami.Units.iconSizes.smallMedium; implicitHeight: implicitWidth }
                 }
                 QQC2.Label {
-                    visible: twitch.live.length === 0 && !twitch.busy
+                    visible: body.liveShown.length === 0 && !twitch.busy
                     opacity: 0.7
-                    text: "None of the channels you follow is live right now."
+                    text: filterField.text !== "" ? "No live channel matches." : "None of the channels you follow is live right now."
                 }
+                // tiles
                 Flow {
                     Layout.fillWidth: true
+                    visible: !twitch.listView
                     spacing: Kirigami.Units.largeSpacing
                     Repeater {
-                        model: twitch.live
+                        model: body.liveShown
                         delegate: Item {
                             id: card
                             required property var modelData
@@ -468,20 +486,76 @@ Kirigami.Page {
                         }
                     }
                 }
+                // list
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: twitch.listView
+                    spacing: 2
+                    Repeater {
+                        model: body.liveShown
+                        delegate: QQC2.ItemDelegate {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            onClicked: pg.watch(modelData.login)
+                            contentItem: RowLayout {
+                                spacing: Kirigami.Units.largeSpacing
+                                Pic { source: modelData.thumb; Layout.preferredWidth: Kirigami.Units.gridUnit * 7; Layout.preferredHeight: Kirigami.Units.gridUnit * 7 * 9 / 16 }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 0
+                                    QQC2.Label { text: modelData.name; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    QQC2.Label { text: modelData.title; elide: Text.ElideRight; Layout.fillWidth: true; maximumLineCount: 1; opacity: 0.85 }
+                                    QQC2.Label { text: modelData.game; elide: Text.ElideRight; Layout.fillWidth: true; maximumLineCount: 1; opacity: 0.6; font: Kirigami.Theme.smallFont }
+                                }
+                                QQC2.Label { text: "● " + pg.compact(modelData.viewers) + " watching"; color: Kirigami.Theme.negativeTextColor }
+                            }
+                        }
+                    }
+                }
 
-                QQC2.Label { visible: twitch.offline.length > 0; text: "Offline"; font.bold: true; font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2 }
+                // everyone else you follow
+                RowLayout {
+                    visible: body.offlineShown.length > 0
+                    spacing: Kirigami.Units.smallSpacing
+                    QQC2.Label { text: "Offline"; font.bold: true; font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2 }
+                    QQC2.Label { text: "(" + body.offlineShown.length + ")"; opacity: 0.6 }
+                }
                 Flow {
                     Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
+                    visible: !twitch.listView
+                    spacing: Kirigami.Units.largeSpacing
                     Repeater {
-                        model: twitch.offline
-                        delegate: QQC2.Button {
+                        model: body.offlineShown
+                        delegate: Item {
                             required property var modelData
-                            text: modelData.name
-                            flat: true
-                            opacity: 0.8
-                            icon.source: ""
+                            width: Kirigami.Units.gridUnit * 5
+                            height: Kirigami.Units.gridUnit * 5.2
+                            ColumnLayout {
+                                anchors.fill: parent
+                                spacing: 3
+                                Pic { round: true; source: modelData.image; Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: Kirigami.Units.gridUnit * 3; Layout.preferredHeight: Kirigami.Units.gridUnit * 3; opacity: 0.75 }
+                                QQC2.Label { text: modelData.name; elide: Text.ElideRight; Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; opacity: 0.8; font: Kirigami.Theme.smallFont }
+                            }
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: pg.watch(modelData.login) }
+                        }
+                    }
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: twitch.listView
+                    spacing: 0
+                    Repeater {
+                        model: body.offlineShown
+                        delegate: QQC2.ItemDelegate {
+                            required property var modelData
+                            Layout.fillWidth: true
                             onClicked: pg.watch(modelData.login)
+                            contentItem: RowLayout {
+                                spacing: Kirigami.Units.largeSpacing
+                                Pic { round: true; source: modelData.image; Layout.preferredWidth: Kirigami.Units.gridUnit * 2; Layout.preferredHeight: Kirigami.Units.gridUnit * 2; opacity: 0.8 }
+                                QQC2.Label { text: modelData.name; Layout.fillWidth: true; elide: Text.ElideRight; opacity: 0.85 }
+                                QQC2.Label { text: "Offline"; opacity: 0.5; font: Kirigami.Theme.smallFont }
+                            }
                         }
                     }
                 }

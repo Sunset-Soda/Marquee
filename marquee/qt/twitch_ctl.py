@@ -112,6 +112,16 @@ class TwitchController(QObject):
     def hasBrowser(self):
         return bool(getattr(self._yt._dlp, "browser", ""))
 
+    @Property(bool, notify=changed)
+    def listView(self):
+        return self._store.list_view
+
+    @Slot(bool)
+    def setListView(self, on: bool):
+        self._store.list_view = bool(on)
+        self._store.save()
+        self.changed.emit()
+
     @Property(str, notify=changed)
     def quality(self):
         return self._store.quality

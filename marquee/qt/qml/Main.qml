@@ -24,7 +24,7 @@ Kirigami.ApplicationWindow {
     }
 
     function openFiles() { filesDialog.open() }
-    function openSubtitleSettings() { subSettings.open() }
+    function openSubtitleSettings() { settings.open() }
     function openSettings() { settings.open() }
     function openFolder() { folderDialog.open() }
     function pickCover(itemId) { coverDialog.itemId = itemId; coverDialog.open() }
@@ -428,6 +428,8 @@ Kirigami.ApplicationWindow {
         title: "Settings"
         standardButtons: Kirigami.Dialog.Close
         padding: Kirigami.Units.largeSpacing
+        function saveSubs() { marquee.saveSubtitleSettings(keyField.text, userField.text, passField.text, langField.text, autoBox.checked, subdlField.text) }
+        onAboutToHide: saveSubs()
         readonly property var styles: [["bars", "Bars"], ["mirror", "Mirror"], ["wave", "Wave"], ["dots", "Dots"], ["scope", "Scope"], ["off", "Off"]]
         onAboutToShow: {
             var cur = marquee.vizStyle()
@@ -436,6 +438,9 @@ Kirigami.ApplicationWindow {
             translucentBox.checked = marquee.translucent
             liveAutoBox.checked = marquee.liveAutoplay()
             syncBox.checked = marquee.autoSyncSubtitles()
+            var c = marquee.subtitleSettings()
+            keyField.text = c.apiKey; userField.text = c.username; passField.text = c.password
+            langField.text = c.language; autoBox.checked = c.auto; subdlField.text = c.subdlKey
             sponsorMaster.checked = marquee.sponsorBlockOn()
             sponsorList.model = marquee.sponsorCategories()
             var bs = youtube.browsers
@@ -535,45 +540,24 @@ Kirigami.ApplicationWindow {
                     }
                 }
                 Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Subtitles" }
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.7
+                    font: Kirigami.Theme.smallFont
+                    text: "Marquee downloads subtitles from OpenSubtitles.com: make a free account there, then create an API key under Profile › API consumers. If OpenSubtitles has nothing, or its daily limit is reached, it can try Subdl as a backup: make a free account at subdl.com and paste its API key below. Keys are saved only on this computer."
+                }
+                QQC2.TextField { id: keyField; Kirigami.FormData.label: "OpenSubtitles API key:"; Layout.minimumWidth: Kirigami.Units.gridUnit * 16; onEditingFinished: settings.saveSubs() }
+                QQC2.TextField { id: userField; Kirigami.FormData.label: "OpenSubtitles username:"; onEditingFinished: settings.saveSubs() }
+                QQC2.TextField { id: passField; Kirigami.FormData.label: "OpenSubtitles password:"; echoMode: TextInput.Password; onEditingFinished: settings.saveSubs() }
+                QQC2.TextField { id: subdlField; Kirigami.FormData.label: "Subdl API key (backup):"; placeholderText: "optional"; onEditingFinished: settings.saveSubs() }
+                QQC2.TextField { id: langField; Kirigami.FormData.label: "Language code:"; placeholderText: "en"; onEditingFinished: settings.saveSubs() }
+                QQC2.CheckBox { id: autoBox; text: "Download automatically when a video has none"; onToggled: settings.saveSubs() }
                 QQC2.CheckBox {
                     id: syncBox
                     text: "Line downloaded subtitles up with the speech"
                     onToggled: marquee.setAutoSyncSubtitles(checked)
                 }
-                QQC2.Button {
-                    text: "OpenSubtitles Account…"
-                    icon.name: "preferences-system-network"
-                    onClicked: { settings.close(); root.openSubtitleSettings() }
-                }
-            }
-        }
-    }
-
-    Kirigami.Dialog {
-        id: subSettings
-        title: "Subtitle Settings"
-        standardButtons: Kirigami.Dialog.Save | Kirigami.Dialog.Cancel
-        padding: Kirigami.Units.largeSpacing
-        onAboutToShow: {
-            var c = marquee.subtitleSettings()
-            keyField.text = c.apiKey; userField.text = c.username; passField.text = c.password
-            langField.text = c.language; autoBox.checked = c.auto; subdlField.text = c.subdlKey
-        }
-        onAccepted: marquee.saveSubtitleSettings(keyField.text, userField.text, passField.text, langField.text, autoBox.checked, subdlField.text)
-        ColumnLayout {
-            spacing: Kirigami.Units.largeSpacing
-            QQC2.Label {
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 24
-                wrapMode: Text.Wrap
-                text: "Marquee downloads subtitles from OpenSubtitles.com. Make a free account there, then create an API key under Profile › API consumers, and enter them below. If OpenSubtitles has nothing, or its daily limit is reached, Marquee can try Subdl as a backup: make a free account at subdl.com and paste its API key in the last box. Keys are saved only on this computer."
-            }
-            Kirigami.FormLayout {
-                QQC2.TextField { id: keyField; Kirigami.FormData.label: "API key:"; Layout.minimumWidth: Kirigami.Units.gridUnit * 16 }
-                QQC2.TextField { id: userField; Kirigami.FormData.label: "Username:" }
-                QQC2.TextField { id: passField; Kirigami.FormData.label: "Password:"; echoMode: TextInput.Password }
-                QQC2.TextField { id: subdlField; Kirigami.FormData.label: "Subdl API key (backup):"; placeholderText: "optional" }
-                QQC2.TextField { id: langField; Kirigami.FormData.label: "Language code:"; placeholderText: "en" }
-                QQC2.CheckBox { id: autoBox; text: "Download automatically when a video has none" }
             }
         }
     }
