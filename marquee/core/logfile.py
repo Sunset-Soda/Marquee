@@ -1,5 +1,6 @@
 """Keep a copy of everything Marquee prints (its own notes and Qt/QML's) in a log file you can hand over when something goes wrong.
 
+Each line carries the time it was printed; ffmpeg's repeated Late SEI warnings are left out.
 The file is ~/.local/share/marquee/marquee.log; the one from the previous run is kept as marquee.log.1.
 Everything is still printed to the terminal as before."""
 from __future__ import annotations
@@ -32,6 +33,9 @@ def start() -> Path | None:
         os.close(w)
 
         def pump():
+            import time
+            noise = ("Late SEI is not implemented", "streams.videolan.org/upload")    # ffmpeg warnings that say nothing and fill the log
+            buf = b""
             with os.fdopen(r, "rb", buffering=0) as src:
                 while True:
                     data = src.read(4096)
@@ -41,7 +45,13 @@ def start() -> Path | None:
                         os.write(real, data)
                     except OSError:
                         pass
-                    out.write(data.decode("utf-8", "replace"))
+                    buf += data
+                    *lines, buf = buf.split(b"\n")
+                    for ln in lines:
+                        text = ln.decode("utf-8", "replace")
+                        if any(n in text for n in noise):
+                            continue
+                        out.write(time.strftime("%H:%M:%S ") + text + "\n")
         threading.Thread(target=pump, daemon=True).start()
         return path
     except Exception:

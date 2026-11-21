@@ -612,7 +612,10 @@ class YtDlp:
             # Marquee itself is turned away, but yt-dlp usually is not: let it fetch the file while the player reads it.
             print(f"[youtube] {video_id}: asking yt-dlp to fetch it instead", file=sys.stderr, flush=True)
             try:
-                return self.fetch_to_cache(video_id, meta)
+                got = self.fetch_to_cache(video_id, meta)
+                # the bigger picture is already downloading (it began before the 360p address was checked): say so, so the
+                # player shows it and swaps to it when it arrives instead of leaving you on 360p
+                return dict(got, upgrade=quick) if quick and not got.get("live") and got.get("res", 360) < quick["res"] else got
             except RuntimeError as e:
                 print(f"[youtube] {video_id}: single-file version failed ({str(e)[:100]}); trying separate picture and sound streams",
                       file=sys.stderr, flush=True)

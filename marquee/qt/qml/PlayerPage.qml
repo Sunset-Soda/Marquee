@@ -385,6 +385,12 @@ Kirigami.Page {
         playbackRate: [0.75, 1, 1.25, 1.5, 2][speed.currentIndex]
         onMediaStatusChanged: {
             if (mediaStatus === MediaPlayer.BufferedMedia) pp.retriedId = ""
+            if (mediaStatus === MediaPlayer.LoadedMedia && !!pp.info.yt) {
+                try {                                   // what is really on screen, for the log
+                    var r = metaData.value(MediaMetaData.Resolution)
+                    console.log("marquee: youtube: " + pp.info.id + " is playing at " + r.width + "x" + r.height + (pp.info.upgradeTo > 0 ? " (" + pp.info.upgradeTo + "p still downloading)" : ""))
+                } catch (e) {}
+            }
             if (mediaStatus === MediaPlayer.LoadedMedia && pp.resumeAt > 0) { position = pp.resumeAt; pp.resumeAt = 0 }
             if (mediaStatus === MediaPlayer.EndOfMedia) {
                 if (pp.isLive) { pp.errorText = "The stream for “" + pp.info.title + "” ended. The channel may be off air, or your connection dropped."; return }
@@ -816,8 +822,9 @@ Kirigami.Page {
                     visible: pp.isVideo && !!info.yt && !pp.isLive
                     readonly property var keys: ["auto"].concat((info.levels || []).slice().sort(function (a, b) { return b - a }).map(String))
                     model: keys.map(function (k) { return k === "auto" ? "Auto · " + (info.res || 360) + "p" : k + "p" })
+                    readonly property bool waiting: info.upgradeTo > 0 && (info.res || 360) < info.upgradeTo
                     currentIndex: Math.max(0, keys.indexOf(info.quality || "auto"))
-                    displayText: (info.quality || "auto") === "auto" ? "Auto · " + (info.res || 360) + "p" : currentText
+                    displayText: waiting ? (info.res || 360) + "p, getting " + info.upgradeTo + "p…" : ((info.quality || "auto") === "auto" ? "Auto · " + (info.res || 360) + "p" : currentText)
                     QQC2.ToolTip.text: "Video quality"
                     QQC2.ToolTip.visible: hovered
                     onActivated: { var at = player.position / 1000; player.pause(); youtube.reopen(info.id.substring(3), at, keys[currentIndex]) }
