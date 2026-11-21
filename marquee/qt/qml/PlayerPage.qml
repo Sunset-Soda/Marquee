@@ -26,6 +26,7 @@ Kirigami.Page {
     readonly property bool wideLayout: width >= Kirigami.Units.gridUnit * 36
     readonly property bool lyricsShown: !isVideo && music.lyricsOn
     property real resumeAt: 0
+    property int defaultAudio: 0                    // the audio track the file starts on (what clicking the chosen track again goes back to)
     property string retriedId: ""                  // a YouTube video already re-opened once after failing (so a real failure still shows)
     property string errorText: ""
     readonly property bool isVideo: info.media === "video"
@@ -385,6 +386,7 @@ Kirigami.Page {
         playbackRate: [0.75, 1, 1.25, 1.5, 2][speed.currentIndex]
         onMediaStatusChanged: {
             if (mediaStatus === MediaPlayer.BufferedMedia) pp.retriedId = ""
+            if (mediaStatus === MediaPlayer.LoadedMedia) pp.defaultAudio = Math.max(0, activeAudioTrack)
             if (mediaStatus === MediaPlayer.LoadedMedia && !!pp.info.yt) {
                 try {                                   // what is really on screen, for the log
                     var r = metaData.value(MediaMetaData.Resolution)
@@ -849,7 +851,11 @@ Kirigami.Page {
                                 text: label
                                 checkable: true
                                 checked: videoPlayer.activeAudioTrack === index
-                                onTriggered: videoPlayer.activeAudioTrack = index
+                                onTriggered: {
+                                    // choosing the track that is already chosen goes back to the one the file started on
+                                    videoPlayer.activeAudioTrack = (index === videoPlayer.activeAudioTrack && index !== pp.defaultAudio) ? pp.defaultAudio : index
+                                    checked = Qt.binding(function () { return videoPlayer.activeAudioTrack === index })   // a click toggles the tick on its own and would break the binding
+                                }
                             }
                             onObjectAdded: (index, object) => audioMenu.insertItem(index, object)
                             onObjectRemoved: (index, object) => audioMenu.removeItem(object)
