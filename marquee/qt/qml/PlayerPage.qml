@@ -830,6 +830,33 @@ Kirigami.Page {
                     onActivated: { var at = player.position / 1000; player.pause(); youtube.reopen(info.id.substring(3), at, keys[currentIndex]) }
                 }
                 QQC2.ToolButton {
+                    id: audioButton
+                    visible: pp.isVideo && !pp.isLive && !info.yt && videoPlayer.audioTracks.length > 1
+                    icon.name: "audio-volume-high"
+                    QQC2.ToolTip.text: "Audio track"
+                    QQC2.ToolTip.visible: hovered
+                    onClicked: audioMenu.popup(audioButton, 0, -audioMenu.height)
+                    QQC2.Menu {
+                        id: audioMenu
+                        Instantiator {
+                            model: videoPlayer.audioTracks.length
+                            delegate: QQC2.MenuItem {
+                                required property int index
+                                readonly property string label: {
+                                    var t = videoPlayer.audioTracks[index].value(MediaMetaData.Title)
+                                    return t ? String(t) : "Audio track " + (index + 1)
+                                }
+                                text: label
+                                checkable: true
+                                checked: videoPlayer.activeAudioTrack === index
+                                onTriggered: videoPlayer.activeAudioTrack = index
+                            }
+                            onObjectAdded: (index, object) => audioMenu.insertItem(index, object)
+                            onObjectRemoved: (index, object) => audioMenu.removeItem(object)
+                        }
+                    }
+                }
+                QQC2.ToolButton {
                     id: ccButton
                     visible: pp.isVideo && !pp.isLive && !info.yt
                     text: "CC"
