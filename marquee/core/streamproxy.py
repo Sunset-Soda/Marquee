@@ -149,6 +149,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not st or st["busy"] or time.monotonic() - st["last"] < st["every"]:
             return
         st["busy"] = True
+        st["last"] = time.monotonic()                          # counted from when a refresh starts, so a slow one doesn't push the next later
         server = self.server
 
         def work():
@@ -161,7 +162,6 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"[youtube] live stream: could not refresh the address: {e}", file=sys.stderr, flush=True)
             finally:
-                st["last"] = time.monotonic()
                 st["busy"] = False
         threading.Thread(target=work, daemon=True).start()
 
