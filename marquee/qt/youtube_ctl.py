@@ -643,6 +643,11 @@ class YoutubeController(QObject):
     def quality(self):
         return self._store.quality
 
+    def _live_address(self, video_id: str):
+        """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""
+        info = self._dlp.resolve(video_id, quality="auto", fast=False)
+        return info["url"], info.get("headers")
+
     def _finish_play(self, info: dict):
         vid = info["id"]
         if info.get("speed"):
@@ -660,7 +665,7 @@ class YoutubeController(QObject):
             "id": f"yt:{vid}", "title": info["title"] or known.get("title", ""), "sub": info["channel"] or known.get("channel", ""),
             "levels": [l["res"] for l in info.get("levels", []) if 360 <= l["res"] <= 1080], "res": info.get("res", 360),
             "quality": self._store.quality, "upgradeTo": (up or {}).get("res", 0), "media": "video", "url": (self._proxy.add_file(info["file"], info.get("size", 0), info.get("proc")) if info.get("file")
-                    else info["url"] if info["live"] else self._proxy.add(info["url"], info.get("headers"))), "exists": True, "pos": self._resume.pop(vid, None) if vid in self._resume else (0.0 if info["live"] else self._store.resume_at(vid)), "dur": info["dur"], "subDelay": 0.0,
+                    else self._proxy.add_live(info["url"], info.get("headers"), refresh=lambda: self._live_address(vid)) if info["live"] else self._proxy.add(info["url"], info.get("headers"))), "exists": True, "pos": self._resume.pop(vid, None) if vid in self._resume else (0.0 if info["live"] else self._store.resume_at(vid)), "dur": info["dur"], "subDelay": 0.0,
             "cover": info["thumb"], "icon": "video-x-generic", "yt": True, "isLive": info["live"]}
         row = dict(known) if known else {"id": vid}
         row.update({"id": vid, "title": info["title"] or row.get("title", ""), "channel": info["channel"] or row.get("channel", ""),

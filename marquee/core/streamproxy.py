@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from .gvfetch import open_stream
@@ -17,6 +18,13 @@ _PASS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "La
 
 
 CHUNK = 10 * 1024 * 1024       # YouTube's own players (and yt-dlp) fetch in pieces this size; whole-file requests get a 403
+
+
+class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):          # a player that hangs up mid-reply (a seek, closing) is not an error
+        import sys
+        if not isinstance(sys.exc_info()[1], (ConnectionError, BrokenPipeError, TimeoutError)):
+            super().handle_error(request, client_address)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -111,8 +119,158 @@ class _Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    @staticmethod
+    def _live_edge(lines: list, keep: int = 12, hold: int = 2) -> list:
+        """A YouTube live playlist holds the whole DVR window (1600+ pieces, about 2 MB). Keep only the newest few so the player
+        starts at the live point, and move the media sequence number along with what was dropped."""
+        if any(l.startswith("#EXT-X-ENDLIST") for l in lines):
+            return lines
+        first = next((i for i, l in enumerate(lines) if l.startswith("#EXTINF")), None)
+        if first is None:
+            return lines
+        head, body = lines[:first], lines[first:]
+        groups, cur = [], []
+        for l in body:
+            cur.append(l)
+            if l.strip() and not l.startswith("#"):
+                groups.append(cur)
+                cur = []
+        if len(groups) <= keep + hold:
+            return lines
+        # the newest pieces are listed before YouTube will serve them (403), so stay a couple of pieces behind
+        groups = groups[:len(groups) - hold] if hold else groups
+        dropped = len(groups) - keep
+        head = [re.sub(r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)", lambda m: m.group(1) + str(int(m.group(2)) + dropped), l) for l in head]
+        kept = [l for g in groups[dropped:] for l in g]
+        return head + kept
+
+    def _maybe_refresh_live(self, token: str):
+        st = getattr(self.server, "live_refresh", {}).get(token)
+        if not st or st["busy"] or time.monotonic() - st["last"] < st["every"]:
+            return
+        st["busy"] = True
+        server = self.server
+
+        def work():
+            import sys
+            try:
+                url, headers = st["fn"]()
+                if url:
+                    server.entries[token] = ("live", url, dict(headers or {}))      # type: ignore[attr-defined]
+                    print("[youtube] live stream: swapped in a fresh address", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[youtube] live stream: could not refresh the address: {e}", file=sys.stderr, flush=True)
+            finally:
+                st["last"] = time.monotonic()
+                st["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _serve_live(self, head: bool, token: str, url: str, headers: dict):
+        """A live HLS stream: YouTube turns the player's own requests away (wrong fingerprint and headers), so the playlist and
+        every piece it names come through here. Addresses inside a playlist are rewritten to point back at this server."""
+        from urllib.parse import parse_qs, quote, urljoin, urlsplit
+        q = parse_qs(urlsplit(self.path).query)
+        target = q["u"][0] if q.get("u") else url
+        h = dict(headers)
+        if self.headers.get("Range"):
+            h["Range"] = self.headers["Range"]
+        import time as _time
+        m = re.search(r"/sq/(\d+)", target)
+        r, err = None, None
+        for attempt in range(8 if m else 1):                  # a brand-new piece can be refused for a few seconds
+            try:
+                r = open_stream(target, h, 20)
+                if attempt:
+                    import sys
+                    print(f"[youtube] live stream: piece {m.group(1)} became available after {attempt} retries", file=sys.stderr, flush=True)
+                break
+            except urllib.error.HTTPError as e:
+                err = e
+                if e.code != 403:
+                    break
+                _time.sleep(1)
+            except OSError:
+                err = None
+                break
+        if r is None and err is None:
+            self.send_error(502)
+            return
+        if err is not None and r is None:
+            e = err
+            import sys
+            try:
+                why = e.read(160)
+            except Exception:
+                why = b""
+            print(f"[youtube] live stream: upstream refused {'piece ' + m.group(1) if m else 'the playlist'}: HTTP {e.code} {why!r}", file=sys.stderr, flush=True)
+            self.send_response(e.code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        port = self.server.server_address[1]                                   # type: ignore[attr-defined]
+
+        def local(addr: str, default: str = "seg.ts") -> str:
+            # ffmpeg only accepts pieces whose address ends in a known extension, so keep the real name (seg.ts, index.m3u8)
+            full = urljoin(target, addr)
+            name = urlsplit(full).path.rsplit("/", 1)[-1]
+            if "." not in name:
+                name = default
+            return f"http://127.0.0.1:{port}/{token}/{quote(name, safe='.')}?u=" + quote(full, safe="")
+        with r:
+            first = r.read(64 * 1024)
+            if first.startswith(b"#EXTM3U"):
+                text = (first + r.read(40_000_000)).decode("utf-8", "replace")
+                out = []
+                was_variant = False
+                for line in text.splitlines():
+                    if line.startswith("#"):
+                        line = re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + local(m.group(1), "init.mp4") + '"', line)
+                        was_variant = line.startswith("#EXT-X-STREAM-INF")
+                    elif line.strip():
+                        line = local(line.strip(), "index.m3u8" if was_variant else "seg.ts")
+                        was_variant = False
+                    out.append(line)
+                out = self._live_edge(out)
+                nums = [int(x) for x in re.findall(r"%2Fsq%2F(\d+)%2F", "\n".join(out))]
+                if nums and getattr(self.server, "_live_seen", None) != (nums[0], nums[-1]):
+                    self.server._live_seen = (nums[0], nums[-1])              # type: ignore[attr-defined]
+                    import sys
+                    print(f"[youtube] live stream: playlist lists pieces {nums[0]} to {nums[-1]} ({len(nums)})", file=sys.stderr, flush=True)
+                data = ("\n".join(out) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                if not head:
+                    try:
+                        self.wfile.write(data)
+                    except OSError:
+                        pass
+                return
+            # a piece is small (a couple of seconds of video): take all of it, so the player is told exactly how long it is.
+            # Without a length ffmpeg treats the end of every piece as a broken connection and gives up on it.
+            body = first
+            try:
+                while len(body) < 40_000_000:
+                    c = r.read(256 * 1024)
+                    if not c:
+                        break
+                    body += c
+            except (OSError, ValueError):
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", r.headers.get("Content-Type") or "video/mp2t")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
     def _serve(self, head: bool):
-        entry = self.server.entries.get(self.path.split("?")[0].strip("/"))     # type: ignore[attr-defined]
+        entry = self.server.entries.get(self.path.split("?")[0].strip("/").split("/")[0])     # type: ignore[attr-defined]
         if not entry:
             self.send_error(404)
             return
@@ -121,6 +279,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if entry[0] == "hls":
             self._serve_hls(head, entry[1], entry[2], entry[3])
+            return
+        if entry[0] == "live":
+            self._maybe_refresh_live(self.path.split("?")[0].strip("/").split("/")[0])
+            entry = self.server.entries.get(self.path.split("?")[0].strip("/").split("/")[0], entry)   # type: ignore[attr-defined]
+            self._serve_live(head, self.path.split("?")[0].strip("/").split("/")[0], entry[1], entry[2])
             return
         _, url, headers = entry
         chunk = getattr(self.server, "chunk", CHUNK)
@@ -209,7 +372,7 @@ class StreamProxy:
 
     def _start(self) -> ThreadingHTTPServer:
         if not self._server:
-            s = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+            s = _Server(("127.0.0.1", 0), _Handler)
             s.daemon_threads = True
             s.entries = {}                                       # type: ignore[attr-defined]
             threading.Thread(target=s.serve_forever, daemon=True).start()
@@ -222,6 +385,21 @@ class StreamProxy:
         self._n += 1
         token = f"s{self._n}"
         s.entries[token] = ("url", url, dict(headers or {}))     # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}"
+
+    def add_live(self, url: str, headers: dict | None = None, refresh=None, every: float = 10.0) -> str:
+        """The local address of a live HLS playlist that is fetched with `headers` (its pieces too).
+
+        YouTube only honours a live address for about a dozen pieces past the moment it was made, so `refresh()` (returning
+        (url, headers)) is called in the background every `every` seconds and the playlist is simply re-read from the new address."""
+        s = self._start()
+        self._n += 1
+        token = f"s{self._n}"
+        s.entries[token] = ("live", url, dict(headers or {}))    # type: ignore[attr-defined]
+        if refresh:
+            if not hasattr(s, "live_refresh"):
+                s.live_refresh = {}                              # type: ignore[attr-defined]
+            s.live_refresh[token] = {"fn": refresh, "every": every, "last": time.monotonic(), "busy": False}   # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}"
 
     def add_file(self, path: str, size: int = 0, proc=None) -> str:

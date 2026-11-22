@@ -92,7 +92,16 @@ Kirigami.Page {
             if ((mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia) && pg.phase === "playing")
                 pg.reconnect("the stream ended")
         }
-        onPlaybackStateChanged: console.log("marquee: twitch: playback state " + playbackState)
+        onPlaybackStateChanged: {
+            console.log("marquee: twitch: playback state " + playbackState)
+            // a paused live stream falls behind what Twitch still keeps: resuming after a while goes back to live
+            if (playbackState === MediaPlayer.PausedState) pg.pausedAt = Date.now()
+            else if (playbackState === MediaPlayer.PlayingState && pg.pausedAt > 0) {
+                var longPause = Date.now() - pg.pausedAt > 15000
+                pg.pausedAt = 0
+                if (longPause && pg.phase === "playing") { console.log("marquee: twitch: resumed after a pause; going back to live"); Qt.callLater(function () { pg.watch(twitch.channel) }) }
+            }
+        }
     }
     // while a channel plays, say every few seconds whether the picture is really moving (for finding a blank screen)
     Timer {
@@ -137,6 +146,7 @@ Kirigami.Page {
     property int reconnects: 0
     property bool inAd: false                       // the commercial break at the start is playing (the channel follows it)
     property int opens: 0                           // how many times a playlist has been (re)opened, to keep each request distinct
+    property double pausedAt: 0
     property int nudges: 0                          // skips past a stall tried on this stream
     property real playingSince: 0
     function reconnect(why) {
@@ -218,9 +228,10 @@ Kirigami.Page {
                 }
                 QQC2.ToolButton {
                     visible: pg.phase === "playing"
-                    icon.name: "view-refresh"
+                    text: "● Live"
+                    highlighted: player.playbackState !== MediaPlayer.PlayingState
                     onClicked: pg.watch(twitch.channel)
-                    QQC2.ToolTip.text: "Reload the stream"; QQC2.ToolTip.visible: hovered
+                    QQC2.ToolTip.text: "Jump back to the live broadcast (also reloads the stream)"; QQC2.ToolTip.visible: hovered
                 }
                 QQC2.Label { text: twitch.stream.height ? twitch.stream.height + "p" : ""; color: "white"; opacity: 0.8 }
                 QQC2.ComboBox {
