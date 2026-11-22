@@ -32,6 +32,8 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 # One stream that has the picture and the sound together; Marquee's player can't join two streams. Usually up to 720p.
 FORMAT = ("best[height<=720][protocol=https][vcodec!=none][acodec!=none]/best[height<=720][vcodec!=none][acodec!=none]"
           "/best[protocol=https][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best")
+# Live streams: the best picture and sound together (HLS offers 1080p60 as itag 301 next to 720p60 as 300), no 720 cap.
+LIVE_FORMAT = "best[protocol=m3u8_native][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best"
 # Ways of asking YouTube, in the order tried: yt-dlp's own choice first, then clients that need no special token.
 CLIENTS = ["", "android_vr", "tv", "mweb", "ios", "web_safari"]
 # Separate picture and sound streams (what the website plays), joined by yt-dlp when the old single-file format is a stub.
@@ -516,10 +518,10 @@ class YtDlp:
     retry_wait = 3.5
     progress: Callable[[str], None] | None = None
 
-    def _attempt(self, video_id: str, client: str, with_login: bool) -> dict:
+    def _attempt(self, video_id: str, client: str, with_login: bool, fmt: str = FORMAT) -> dict:
         self._client = client + ("+login" if with_login else "")
         extra = ["--force-ipv4", *js_runtime_args()] + (["--extractor-args", f"youtube:player_client={client}"] if client else [])
-        d = self._json("--dump-single-json", "--no-playlist", "-f", FORMAT, *extra,
+        d = self._json("--dump-single-json", "--no-playlist", "-f", fmt, *extra,
                        f"https://www.youtube.com/watch?v={video_id}", cookies=with_login)
         return self._shape(d, video_id)
 
@@ -531,7 +533,8 @@ class YtDlp:
         return f.exists() and f.stat().st_size >= 1_000_000
 
     def resolve(self, video_id: str, probe: Callable[[dict], bool] | None = None, quality: str = "auto",
-                speed: float = 0.0, fast: bool = False, on_upgrade: Callable[[dict], None] | None = None) -> dict:
+                speed: float = 0.0, fast: bool = False, on_upgrade: Callable[[dict], None] | None = None,
+                uncapped: bool = False, clients: list[str] | None = None) -> dict:
         """What the player needs for one video: {id, title, channel, url, headers, dur, thumb, live, levels, res}.
 
         fast: when a bigger size is wanted and isn't already saved, start streaming 360p now and hand back
@@ -552,7 +555,9 @@ class YtDlp:
         first: dict | None = None
         first_err: Exception | None = None
         try:
-            first = self._attempt(video_id, "", False)
+            if clients:
+                raise RuntimeError("skipped")                 # only the asked-for clients are tried (a quick refresh)
+            first = self._attempt(video_id, "", False, LIVE_FORMAT if uncapped else FORMAT)
         except Exception as e:
             first_err = e
         want = 360
@@ -587,7 +592,7 @@ class YtDlp:
         # Without your login first: some clients (android_vr) work best anonymously and stop working when cookies are sent.
         # Then, if you chose a browser, the same clients again with its login.
         for with_login in ([False, True] if self.browser else [False]):
-            for client in CLIENTS:
+            for client in (clients or CLIENTS):
                 try:
                     if client == "" and not with_login:
                         if first_err:
@@ -595,7 +600,14 @@ class YtDlp:
                         info = first
                         self._client = ""
                     else:
-                        info = self._attempt(video_id, client, with_login)
+                        info = self._attempt(video_id, client, with_login, LIVE_FORMAT if uncapped else FORMAT)
+                        if info["live"] and not uncapped and quality in ("auto", "1080") and info["res"] < 1080:
+                            try:                                  # a live stream: look again without the 720p cap for a bigger picture
+                                bigger = self._attempt(video_id, client, with_login, LIVE_FORMAT)
+                                if bigger["live"] and bigger["res"] > info["res"]:
+                                    info = bigger
+                            except Exception:
+                                pass
                 except Exception as e:
                     last = e
                     if with_login and "cookie" in str(e).lower():

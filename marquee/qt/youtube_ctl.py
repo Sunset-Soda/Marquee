@@ -645,7 +645,16 @@ class YoutubeController(QObject):
 
     def _live_address(self, video_id: str):
         """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""
-        info = self._dlp.resolve(video_id, quality="auto", fast=False)
+        good = getattr(self, "_live_client", "") or self._dlp._client.replace("+login", "")
+        info = None
+        if good:                                            # the way that worked a moment ago, with nothing else tried first
+            try:
+                info = self._dlp.resolve(video_id, quality="auto", fast=False, uncapped=True, clients=[good])
+            except Exception:
+                info = None
+        if info is None:
+            info = self._dlp.resolve(video_id, quality="auto", fast=False, uncapped=True)
+        self._live_client = self._dlp._client.replace("+login", "")
         return info["url"], info.get("headers")
 
     def _finish_play(self, info: dict):
