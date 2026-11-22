@@ -33,6 +33,32 @@ Kirigami.Page {
     property int defaultAudio: 0                    // the audio track the file starts on (what clicking the chosen track again goes back to)
     property string retriedId: ""                  // a YouTube video already re-opened once after failing (so a real failure still shows)
     property string errorText: ""
+    // The YouTube caption track showing ("" = off). It lives in the controller, because this page is rebuilt when the bigger picture arrives.
+    readonly property string capSel: (!!info.yt && !!info.id && youtube.captionVideo === info.id.substring(3)) ? youtube.captionTrack : ""
+    property string capFor: ""
+    property string capNote: ""
+    function pickCaption(track) {
+        subText = ""
+        capNote = ""
+        if (track === "") { console.log("marquee: captions: switched off from the menu"); youtube.clearCaption() }
+        else { subBadge = "Loading captions…"; subBadgeTimer.restart(); youtube.loadCaption(info.id.substring(3), track) }
+    }
+    function toggleCaptions() {
+        if (!info.yt || isLive) return
+        if (capSel !== "") pickCaption("")
+        else { var t = youtube.preferredCaption(info.captions || []); if (t !== "") pickCaption(t) }
+    }
+    onInfoChanged: if (!!info && !!info.id && info.id !== capFor) {       // (a page starts with an empty info: that is not a new video)
+        capFor = info.id || ""
+        capNote = ""
+        // a different video starts without captions; the same one (the page rebuilt for 1080p) keeps them
+        console.log("marquee: captions: page opened for " + info.id + "; controller has " + youtube.captionVideo + " / " + youtube.captionTrack)
+        if (!info.yt || !info.id || youtube.captionVideo !== info.id.substring(3)) youtube.clearCaption()
+    }
+    property bool infoOpen: false                  // the side panel with a YouTube video's description, chapters and comments
+    property int infoTab: 0
+    function seekTo(seconds) { if (pp.player && !pp.isLive) pp.player.position = seconds * 1000 }
+    function openLink(link) { if (String(link).indexOf("seek:") === 0) seekTo(parseInt(String(link).substring(5))); else Qt.openUrlExternally(link) }
     readonly property bool isVideo: info.media === "video"
     // Live TV: a stream with no end, no seeking and no resume point. `nowNext` feeds the on-screen guide strip.
     readonly property bool isLive: !!info.live
@@ -224,6 +250,7 @@ Kirigami.Page {
         marquee.selectSubtitle(itemId, id)
     }
     function toggleSubtitles() {
+        if (!!info.yt) { toggleCaptions(); return }
         if (subSel !== "") pickSubtitle("")
         else if (subLast !== "") pickSubtitle(subLast)
         else if (subTracks.length > 0) pickSubtitle(subTracks[0].id)
@@ -348,6 +375,19 @@ Kirigami.Page {
                 }
             }
         }
+    }
+    Connections {
+        target: youtube
+        function onCaptionReady(vid, track) { if (pp.capSel === track && !!pp.info.id && pp.info.id === "yt:" + vid) pp.subBadge = "" }
+        function onCaptionFailed(vid, why) {
+            if (!!pp.info.id && pp.info.id === "yt:" + vid) { pp.capNote = ""; pp.subBadge = "Couldn’t load captions: " + why; subBadgeTimer.restart() }
+        }
+    }
+    Timer {
+        interval: 100
+        repeat: true
+        running: pp.isVideo && !!pp.info.yt && pp.capSel !== ""
+        onTriggered: pp.subText = youtube.captionAt(player.position / 1000)
     }
     Timer {
         interval: 50
@@ -479,7 +519,8 @@ Kirigami.Page {
     Shortcut { sequences: ["N"]; onActivated: pp.step(1) }
     Shortcut { sequences: ["P"]; onActivated: pp.step(-1) }
     Shortcut { sequences: ["F", "F11"]; onActivated: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
-    Shortcut { sequences: ["Escape"]; onActivated: pp.leave() }
+    Shortcut { sequences: ["Escape"]; onActivated: pp.infoOpen ? pp.infoOpen = false : pp.leave() }
+    Shortcut { sequences: ["I"]; enabled: pp.isVideo && !!pp.info.yt; onActivated: pp.infoOpen = !pp.infoOpen }
 
     Rectangle {
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: parent.bottom }
@@ -856,6 +897,54 @@ Kirigami.Page {
                     onMoved: { if (!pp.isVideo) pp.music.volume = value }
                     implicitWidth: Kirigami.Units.gridUnit * 6
                 }
+                QQC2.ToolButton {
+                    visible: pp.isVideo && !!info.yt
+                    text: "Info"
+                    checkable: true
+                    checked: pp.infoOpen
+                    onClicked: pp.infoOpen = checked
+                    QQC2.ToolTip.text: "Description, chapters and comments (I)"
+                    QQC2.ToolTip.visible: hovered
+                }
+                QQC2.ToolButton {
+                    id: ytCcButton
+                    visible: pp.isVideo && !pp.isLive && !!info.yt
+                    text: "CC"
+                    font.bold: true
+                    checked: pp.capSel !== ""
+                    QQC2.ToolTip.text: (info.captions || []).length ? "Captions (C)" : "This video has no captions"
+                    QQC2.ToolTip.visible: hovered
+                    onClicked: ytCcMenu.popup(ytCcButton, 0, -ytCcMenu.height)
+                    QQC2.Menu {
+                        id: ytCcMenu
+                        QQC2.MenuItem { text: "Off"; checkable: true; checked: pp.capSel === ""; onTriggered: pp.pickCaption("") }
+                        Instantiator {
+                            model: info.captions || []
+                            delegate: QQC2.MenuItem {
+                                required property var modelData
+                                text: modelData.label
+                                checkable: true
+                                checked: pp.capSel === modelData.id
+                                onTriggered: pp.pickCaption(modelData.id)
+                            }
+                            onObjectAdded: (index, object) => ytCcMenu.insertItem(index + 1, object)
+                            onObjectRemoved: (index, object) => ytCcMenu.removeItem(object)
+                        }
+                        QQC2.MenuItem {
+                            enabled: false
+                            visible: (info.captions || []).length === 0
+                            height: visible ? implicitHeight : 0
+                            text: "No captions for this video"
+                        }
+                        QQC2.MenuSeparator {}
+                        QQC2.Menu {
+                            title: "Size"
+                            QQC2.MenuItem { text: "Small"; checkable: true; checked: pp.subSize === 0; onTriggered: pp.setSize(0) }
+                            QQC2.MenuItem { text: "Medium"; checkable: true; checked: pp.subSize === 1; onTriggered: pp.setSize(1) }
+                            QQC2.MenuItem { text: "Large"; checkable: true; checked: pp.subSize === 2; onTriggered: pp.setSize(2) }
+                        }
+                    }
+                }
                 QQC2.ComboBox {
                     id: qualityBox
                     visible: pp.isVideo && !!info.yt && !pp.isLive
@@ -1020,5 +1109,152 @@ Kirigami.Page {
         height: subBadgeLabel.implicitHeight + 8
         Text { id: subBadgeLabel; anchors.centerIn: parent; width: parent.width - 16; color: "white"; font.pixelSize: 12
                elide: Text.ElideRight; horizontalAlignment: Text.AlignHCenter; text: pp.subBadge }
+    }
+    // YouTube: description, chapters and comments, in a panel on the right of the picture
+    Rectangle {
+        id: infoPanel
+        visible: pp.infoOpen && pp.isVideo && !!pp.info.yt
+        anchors { top: parent.top; right: parent.right; bottom: parent.bottom }
+        anchors.bottomMargin: pp.fs ? 0 : controls.height
+        width: Math.min(Kirigami.Units.gridUnit * 26, pp.width * (pp.wideLayout ? 0.4 : 0.85))
+        z: 30
+        color: "#ee101218"
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+        readonly property string vid: pp.info.id ? pp.info.id.substring(3) : ""
+        readonly property var cm: youtube.commentsData
+        function wantComments() { if (pp.infoTab === 2 && pp.infoOpen && vid !== "") youtube.loadComments(vid) }
+        onVisibleChanged: wantComments()
+        Connections { target: pp; function onInfoTabChanged() { infoPanel.wantComments() } }
+        Connections { target: pp; function onInfoChanged() { infoPanel.wantComments() } }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.smallSpacing
+            spacing: Kirigami.Units.smallSpacing
+            RowLayout {
+                Layout.fillWidth: true
+                Text {
+                    Layout.fillWidth: true; Layout.leftMargin: 6
+                    text: pp.info.title || ""; color: "white"; font.pixelSize: 15; font.weight: Font.Bold
+                    wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                }
+                QQC2.ToolButton { icon.name: "window-close"; display: QQC2.AbstractButton.IconOnly; text: "Close"; onClicked: pp.infoOpen = false }
+            }
+            Text {
+                Layout.fillWidth: true; Layout.leftMargin: 6
+                visible: text !== ""
+                color: "#b0ffffff"; font.pixelSize: 12; elide: Text.ElideRight
+                text: [pp.info.sub || "", pp.info.views ? youtube.countText(pp.info.views) + " views" : "", pp.info.uploaded || ""].filter(function (x) { return x !== "" }).join("  ·  ")
+            }
+            QQC2.TabBar {
+                id: infoTabs
+                Layout.fillWidth: true
+                currentIndex: pp.infoTab
+                onCurrentIndexChanged: pp.infoTab = currentIndex
+                QQC2.TabButton { text: "Description" }
+                QQC2.TabButton { text: "Chapters" + ((pp.info.chapters || []).length ? " (" + pp.info.chapters.length + ")" : "") }
+                QQC2.TabButton { text: "Comments"; enabled: !pp.isLive }
+            }
+            Item {
+                id: tabArea
+                Layout.fillWidth: true; Layout.fillHeight: true
+                Layout.minimumHeight: 0; Layout.preferredHeight: 50      // sized by the panel, never by how long the text is
+                clip: true
+                Flickable {
+                    id: descFlick
+                    anchors.fill: parent
+                    visible: pp.infoTab === 0
+                    clip: true
+                    contentWidth: width
+                    contentHeight: descText.implicitHeight + 16
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickableDirection: Flickable.VerticalFlick
+                    QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+                    Text {
+                        id: descText
+                        x: 6
+                        width: descFlick.width - 18
+                        textFormat: Text.RichText
+                        wrapMode: Text.Wrap
+                        color: "#e6ffffff"; linkColor: "#9fb4ff"; font.pixelSize: 13
+                        text: pp.info.desc ? pp.info.desc : "<i>This video has no description.</i>"
+                        onLinkActivated: link => pp.openLink(link)
+                    }
+                }
+                ListView {
+                    id: chapterList
+                    anchors.fill: parent
+                    visible: pp.infoTab === 1
+                    clip: true
+                    model: pp.info.chapters || []
+                    QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+                    readonly property real nowSec: pp.player ? pp.player.position / 1000 : 0
+                    delegate: QQC2.ItemDelegate {
+                        required property var modelData
+                        required property int index
+                        width: ListView.view.width
+                        readonly property real nextStart: index + 1 < chapterList.count ? chapterList.model[index + 1].start : 1e9
+                        highlighted: chapterList.nowSec >= modelData.start && chapterList.nowSec < nextStart
+                        contentItem: RowLayout {
+                            spacing: Kirigami.Units.smallSpacing
+                            Text { text: youtube.clockText(modelData.start); color: "#9fb4ff"; font.pixelSize: 12; Layout.preferredWidth: Kirigami.Units.gridUnit * 3 }
+                            Text { Layout.fillWidth: true; text: modelData.title; color: "white"; font.pixelSize: 13; wrapMode: Text.Wrap }
+                        }
+                        onClicked: pp.seekTo(modelData.start)
+                    }
+                    Text {
+                        anchors.centerIn: parent; width: parent.width - 24; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                        visible: chapterList.count === 0
+                        text: "This video has no chapters."; color: "#b0ffffff"; font.pixelSize: 13
+                    }
+                }
+                Item {
+                    anchors.fill: parent
+                    visible: pp.infoTab === 2
+                    ListView {
+                        id: commentList
+                        anchors.fill: parent
+                        clip: true
+                        spacing: Kirigami.Units.smallSpacing
+                        model: infoPanel.cm.id === infoPanel.vid ? infoPanel.cm.items : []
+                        QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            width: ListView.view.width - 12
+                            x: 6
+                            spacing: 2
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text { text: (modelData.pinned ? "📌 " : "") + modelData.author; color: modelData.uploader ? "#ffd479" : "#9fb4ff"; font.pixelSize: 12; font.weight: Font.Bold; elide: Text.ElideRight; Layout.maximumWidth: parent.width * 0.6 }
+                                Text { text: modelData.ago; color: "#80ffffff"; font.pixelSize: 11 }
+                                Item { Layout.fillWidth: true }
+                                Text { visible: modelData.likes > 0; text: "👍 " + youtube.countText(modelData.likes); color: "#b0ffffff"; font.pixelSize: 11 }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                textFormat: Text.RichText; wrapMode: Text.Wrap
+                                color: "#e6ffffff"; linkColor: "#9fb4ff"; font.pixelSize: 13
+                                text: modelData.html
+                                onLinkActivated: link => pp.openLink(link)
+                            }
+                            Rectangle { Layout.fillWidth: true; height: 1; color: "#20ffffff" }
+                        }
+                    }
+                    ColumnLayout {
+                        anchors.centerIn: parent
+                        width: parent.width - 24
+                        visible: infoPanel.cm.id !== infoPanel.vid || infoPanel.cm.state !== "done" || commentList.count === 0
+                        QQC2.BusyIndicator { Layout.alignment: Qt.AlignHCenter; running: visible && infoPanel.cm.state === "loading" }
+                        Text {
+                            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                            color: "#b0ffffff"; font.pixelSize: 13
+                            text: infoPanel.cm.state === "error" ? "Couldn’t load comments: " + infoPanel.cm.error
+                                  : infoPanel.cm.state === "done" ? "No comments (they may be turned off)."
+                                  : "Loading comments…"
+                        }
+                        QQC2.Button { Layout.alignment: Qt.AlignHCenter; visible: infoPanel.cm.state === "error"; text: "Try again"; onClicked: youtube.retryComments(infoPanel.vid) }
+                    }
+                }
+            }
+        }
     }
 }

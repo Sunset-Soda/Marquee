@@ -61,6 +61,10 @@ class YoutubeController(QObject):
         self._resume: dict[str, float] = {}
         self._upgrade_res: dict[str, int] = {}
         self._upgraded: dict[str, dict] = {}
+        self._comments: dict[str, dict] = {}        # video id -> {"state": loading|done|error, "items": [...], "error": str}
+        self._comments_for = ""
+        self._cap = None                            # the Timeline of the caption track being shown
+        self._cap_for, self._cap_sel = "", ""
         self._progress.connect(self._on_progress)
         self._dlp.progress = self._progress.emit
         self._failed.connect(self._on_failed)
@@ -130,6 +134,17 @@ class YoutubeController(QObject):
         elif key.startswith("play:"):
             self._finish_play(data)
             data = []
+        elif key.startswith("comments:"):
+            self._comments[key[9:]] = {"state": "done", "items": data, "error": ""}
+            data = []
+        elif key.startswith("cap:"):
+            _, vid, track = key.split(":", 2)
+            if (vid, track) == (self._cap_for, self._cap_sel):
+                from ..core import subtitles
+                self._cap = subtitles.Timeline(data)
+                _log(f"captions: showing {len(data)} lines for {vid} from {track}")
+                self.captionReady.emit(vid, track)
+            data = []
         if isinstance(data, list):
             self._remember([v for v in data if isinstance(v, dict) and "title" in v and "dur" in v])
         self.changed.emit()
@@ -140,6 +155,19 @@ class YoutubeController(QObject):
 
     def _on_failed(self, key: str, msg: str):
         _log(f"{key}: {msg}")
+        if key.startswith("cap:"):
+            self._busy.discard(key)
+            _, vid, track = key.split(":", 2)
+            if (vid, track) == (self._cap_for, self._cap_sel):
+                self._cap, self._cap_sel = None, ""
+                self.captionChanged.emit()
+                self.captionFailed.emit(vid, msg)
+            return
+        if key.startswith("comments:"):                 # not an error for the page: just say so in the comments panel
+            self._busy.discard(key)
+            self._comments[key[9:]] = {"state": "error", "items": [], "error": msg}
+            self.changed.emit()
+            return
         if key.startswith("play:") and key[5:] in self._shorts:
             self._shorts.discard(key[5:])
             self._short_run.discard(key[5:])
@@ -166,6 +194,9 @@ class YoutubeController(QObject):
 
     positionsChanged = Signal()
     _beginUpgrade = Signal(str, object)   # from the lookup thread: start the bigger download at once
+    captionChanged = Signal()           # which caption track is on (or that it was turned off)
+    captionReady = Signal(str, str)     # video id, track id: this caption track is loaded and showing
+    captionFailed = Signal(str, str)    # video id, why not
     upgradeReady = Signal(str)          # the bigger picture for this video has finished downloading
 
     def _on_quit(self):
@@ -648,6 +679,79 @@ class YoutubeController(QObject):
     def quality(self):
         return self._store.quality
 
+    @Slot(str, str)
+    def loadCaption(self, video_id: str, track_id: str):
+        """Fetch and show one caption track ("s:en" made by the uploader, "a:en-orig" auto-generated). Says captionReady when it is up."""
+        kind, _, lang = track_id.partition(":")
+        self._cap_for, self._cap_sel, self._cap = video_id, track_id, None
+        self._store.set_caption_lang(lang.split("-")[0])
+        self.captionChanged.emit()
+        self._job(f"cap:{video_id}:{track_id}", lambda: self._dlp.caption_cues(video_id, lang, kind == "a"))
+
+    @Property(str, notify=captionChanged)
+    def captionTrack(self):
+        """The caption track that is on ("" = off). Kept here, not in the player page, because the page is rebuilt when the
+        1080p picture or a new quality arrives."""
+        return self._cap_sel
+
+    @Property(str, notify=captionChanged)
+    def captionVideo(self):
+        return self._cap_for
+
+    @Slot()
+    def clearCaption(self):
+        if self._cap_sel:
+            _log(f"captions: turned off for {self._cap_for} (was {self._cap_sel})")
+        self._cap, self._cap_sel = None, ""
+        self.captionChanged.emit()
+
+    @Slot(float, result=str)
+    def captionAt(self, seconds: float) -> str:
+        """What the caption says at this moment, as markup for the picture (empty when nothing is shown)."""
+        if not self._cap or not self._cap_sel:
+            return ""
+        from ..core import subtitles
+        return subtitles.to_markup(self._cap.at(seconds), "<br>")
+
+    @Slot("QVariantList", result=str)
+    def preferredCaption(self, tracks) -> str:
+        """Which of a video's caption tracks to turn on: your last language (uploader's own first), else the first one."""
+        tracks = [t for t in tracks or [] if isinstance(t, dict)]
+        want = self._store.caption_lang
+        pick = ([t for t in tracks if want and t["lang"].split("-")[0] == want and not t["auto"]]
+                or [t for t in tracks if want and t["lang"].split("-")[0] == want] or tracks)
+        return pick[0]["id"] if pick else ""
+
+    @Slot(float, result=str)
+    def countText(self, n: float) -> str:
+        return yt.short_count(int(n))
+
+    @Slot(float, result=str)
+    def clockText(self, seconds: float) -> str:
+        return yt.clock(seconds)
+
+    @Slot(str)
+    def loadComments(self, video_id: str):
+        """Fetch the top comments of a video (once; asking again for the same video does nothing)."""
+        self._comments_for = video_id
+        if self._comments.get(video_id, {}).get("state") in ("loading", "done"):
+            self.changed.emit()
+            return
+        self._comments[video_id] = {"state": "loading", "items": [], "error": ""}
+        self.changed.emit()
+        self._job(f"comments:{video_id}", lambda: self._dlp.comments(video_id))
+
+    @Slot(str)
+    def retryComments(self, video_id: str):
+        self._comments.pop(video_id, None)
+        self.loadComments(video_id)
+
+    @Property("QVariantMap", notify=changed)
+    def commentsData(self):
+        """{id, state, items, error} for the video whose comments were asked for last."""
+        c = self._comments.get(self._comments_for) or {"state": "", "items": [], "error": ""}
+        return {"id": self._comments_for, **c}
+
     def _live_address(self, video_id: str):
         """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""
         good = getattr(self, "_live_client", "") or self._dlp._client.replace("+login", "")
@@ -680,7 +784,8 @@ class YoutubeController(QObject):
             "levels": [l["res"] for l in info.get("levels", []) if 360 <= l["res"] <= 1080], "res": info.get("res", 360),
             "quality": self._store.quality, "upgradeTo": (up or {}).get("res", 0), "media": "video", "url": (self._proxy.add_file(info["file"], info.get("size", 0), info.get("proc")) if info.get("file")
                     else self._proxy.add_live(info["url"], info.get("headers"), refresh=lambda: self._live_address(vid)) if info["live"] else self._proxy.add(info["url"], info.get("headers"))), "exists": True, "pos": self._resume.pop(vid, None) if vid in self._resume else (0.0 if info["live"] else self._store.resume_at(vid)), "dur": info["dur"], "subDelay": 0.0,
-            "cover": info["thumb"], "icon": "video-x-generic", "yt": True, "isLive": info["live"]}
+            "cover": info["thumb"], "icon": "video-x-generic", "yt": True, "isLive": info["live"],
+            "desc": info.get("desc", ""), "chapters": info.get("chapters", []), "captions": info.get("captions", []), "views": info.get("views", 0), "uploaded": info.get("uploaded", "")}
         row = dict(known) if known else {"id": vid}
         row.update({"id": vid, "title": info["title"] or row.get("title", ""), "channel": info["channel"] or row.get("channel", ""),
                     "thumb": row.get("thumb") or info["thumb"], "dur": info["dur"] or row.get("dur", 0)})
