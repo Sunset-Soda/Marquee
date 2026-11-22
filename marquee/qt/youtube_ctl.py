@@ -220,11 +220,16 @@ class YoutubeController(QObject):
         self._upgrade_res[vid] = res
 
         def work():
-            try:
-                return self._dlp.fetch_dash(vid, meta, res)
-            except Exception as e:
-                _log(f"upgrade to {res}p failed: {e}")
-                return None
+            # YouTube sometimes answers 403 to a download that starts right as the video is opened; a short wait and another go fixes it
+            import time
+            for attempt in range(3):
+                try:
+                    return self._dlp.fetch_dash(vid, meta, res)
+                except Exception as e:
+                    _log(f"upgrade to {res}p failed: {e}" + (f"; trying again in {4 * (attempt + 1)}s" if attempt < 2 else ""))
+                    if attempt < 2:
+                        time.sleep(4 * (attempt + 1))
+            return None
         self._job(f"up:{vid}", work)
 
     @Slot(str, float)
