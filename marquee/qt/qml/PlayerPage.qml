@@ -26,6 +26,10 @@ Kirigami.Page {
     readonly property bool wideLayout: width >= Kirigami.Units.gridUnit * 36
     readonly property bool lyricsShown: !isVideo && music.lyricsOn
     property real resumeAt: 0
+    property int liveStill: 0                       // checks in a row that a live YouTube stream's clock has not moved
+    property real liveLast: -1
+    property int liveRetries: 0
+    property double pausedAt: 0                     // when a live stream was paused, so resuming after a while can go back to the live edge
     property int defaultAudio: 0                    // the audio track the file starts on (what clicking the chosen track again goes back to)
     property string retriedId: ""                  // a YouTube video already re-opened once after failing (so a real failure still shows)
     property string errorText: ""
@@ -198,6 +202,13 @@ Kirigami.Page {
         if (n.indexOf("yt:") === 0) { youtube.play(n.substring(3)); return true }     // next in a YouTube playlist
         if (n !== "") { load(n); return true }
         return false
+    }
+    // a live YouTube stream only keeps about half a minute behind the live edge, so anything older has gone: load it again
+    function goLive() {
+        if (!info.isLive) return
+        pausedAt = 0; liveStill = 0; liveLast = -1
+        // ask YouTube for a fresh address every time: reloading the old one can be refused (HTTP 403) and then nothing plays
+        youtube.reopen(info.id.substring(3), 0, youtube.quality)
     }
     function toggle() { player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play() }
     function leave() {
@@ -384,6 +395,15 @@ Kirigami.Page {
         audioOutput: AudioOutput { id: audioOut; volume: volumeSlider.value }
         videoOutput: video
         playbackRate: [0.75, 1, 1.25, 1.5, 2][speed.currentIndex]
+        onPlaybackStateChanged: {
+            if (!pp.info.yt || !pp.info.isLive) return
+            if (playbackState === MediaPlayer.PausedState) pp.pausedAt = Date.now()
+            else if (playbackState === MediaPlayer.PlayingState && pp.pausedAt > 0) {
+                var longPause = Date.now() - pp.pausedAt > 15000
+                pp.pausedAt = 0
+                if (longPause) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(pp.goLive) }
+            }
+        }
         onMediaStatusChanged: {
             if (mediaStatus === MediaPlayer.BufferedMedia) pp.retriedId = ""
             if (mediaStatus === MediaPlayer.LoadedMedia) pp.defaultAudio = Math.max(0, activeAudioTrack)
@@ -430,6 +450,23 @@ Kirigami.Page {
 
     Shortcut { sequences: ["Space"]; onActivated: pp.toggle() }
     Shortcut { sequences: ["K"]; onActivated: pp.toggle() }
+    // a live YouTube stream that stops (its addresses run out or are refused) is started again from a fresh address
+    Timer {
+        interval: 3000
+        repeat: true
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && videoPlayer.playbackState === MediaPlayer.PlayingState
+        onTriggered: {
+            var p = videoPlayer.position
+            if (p === pp.liveLast) pp.liveStill++
+            else { pp.liveStill = 0; pp.liveRetries = 0 }
+            pp.liveLast = p
+            if (pp.liveStill >= 3 && pp.liveRetries < 3) {
+                pp.liveRetries++
+                console.log("marquee: youtube: the live stream stopped at " + Math.round(p / 1000) + "s; starting it again (" + pp.liveRetries + ")")
+                pp.goLive()
+            }
+        }
+    }
     Shortcut { sequences: ["Up", "PgUp"]; enabled: pp.isLive; onActivated: pp.step(1) }
     Shortcut { sequences: ["Down", "PgDown"]; enabled: pp.isLive; onActivated: pp.step(-1) }
     Shortcut { sequences: ["Right"]; enabled: !pp.isLive; onActivated: player.position = Math.min(player.duration, player.position + 10000) }
@@ -830,6 +867,14 @@ Kirigami.Page {
                     QQC2.ToolTip.text: "Video quality"
                     QQC2.ToolTip.visible: hovered
                     onActivated: { var at = player.position / 1000; player.pause(); youtube.reopen(info.id.substring(3), at, keys[currentIndex]) }
+                }
+                QQC2.ToolButton {
+                    visible: pp.isVideo && !!info.yt && !!info.isLive
+                    text: "● Live"
+                    highlighted: videoPlayer.playbackState !== MediaPlayer.PlayingState
+                    onClicked: pp.goLive()
+                    QQC2.ToolTip.text: "Jump back to the live broadcast"
+                    QQC2.ToolTip.visible: hovered
                 }
                 QQC2.ToolButton {
                     id: audioButton

@@ -2572,3 +2572,112 @@ class TwitchAdStateTests(unittest.TestCase):
         self.assertIn("d0.ts", main)
         self.assertNotIn("#EXT-X-ENDLIST", main)
         self.assertFalse(st.pending())
+
+
+class LiveProxyTests(unittest.TestCase):
+    def test_live_address_is_swapped_for_a_fresh_one(self):
+        import threading, time, urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from marquee.core.streamproxy import StreamProxy
+
+        class Up(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = (b"#EXTM3U\n#EXTINF:2.0,\nseg1.ts\n") if "old" in self.path else (b"#EXTM3U\n#EXTINF:2.0,\nfresh.ts\n")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        up = ThreadingHTTPServer(("127.0.0.1", 0), Up)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{up.server_address[1]}"
+        px = StreamProxy()
+        try:
+            local = px.add_live(base + "/old.m3u8", {}, refresh=lambda: (base + "/new.m3u8", {}), every=0.05)
+            self.assertIn("seg1.ts", urllib.request.urlopen(local).read().decode())
+            time.sleep(0.2)
+            urllib.request.urlopen(local).read()               # this poll starts the refresh
+            time.sleep(0.5)
+            self.assertIn("fresh.ts", urllib.request.urlopen(local).read().decode())
+        finally:
+            px.stop()
+            up.shutdown()
+
+    def test_long_live_playlist_is_cut_to_the_live_edge(self):
+        from marquee.core.streamproxy import _Handler
+        head = ["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:100"]
+        lines = head + [x for i in range(100, 150) for x in (f"#EXTINF:2.0,", f"s{i}.ts")]
+        out = _Handler._live_edge(lines, 12)
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:136", out)
+        self.assertEqual([l for l in out if l.endswith(".ts")][0], "s136.ts")
+        self.assertEqual(len([l for l in out if l.endswith(".ts")]), 12)
+        self.assertEqual(_Handler._live_edge(lines + ["#EXT-X-ENDLIST"], 12), lines + ["#EXT-X-ENDLIST"])
+
+    def test_playlist_and_pieces_come_through_with_headers(self):
+        import threading
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from marquee.core.streamproxy import StreamProxy
+
+        class Up(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.headers.get("User-Agent") != "TestUA/1":          # like googlevideo: refuse a client with the wrong headers
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path.startswith("/live.m3u8"):
+                    body = b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\nseg1.ts\n#EXTINF:2.0,\nseg2.ts\n"
+                else:
+                    body = b"PIECE" + self.path.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        up = ThreadingHTTPServer(("127.0.0.1", 0), Up)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        px = StreamProxy()
+        try:
+            local = px.add_live(f"http://127.0.0.1:{up.server_address[1]}/live.m3u8", {"User-Agent": "TestUA/1"})
+            text = urllib.request.urlopen(local).read().decode()
+            lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(all(ln.startswith("http://127.0.0.1:") and "?u=" in ln for ln in lines))
+            self.assertTrue(all(ln.split("?")[0].endswith(".ts") for ln in lines))      # ffmpeg only accepts known extensions
+            self.assertIn('URI="http://127.0.0.1:', text)
+            self.assertEqual(urllib.request.urlopen(lines[0]).read(), b"PIECE/seg1.ts")
+        finally:
+            px.stop()
+            up.shutdown()
+
+
+    def test_piece_without_a_length_is_sent_with_one(self):
+        import threading
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from marquee.core.streamproxy import StreamProxy
+
+        class Up(BaseHTTPRequestHandler):                    # protocol HTTP/1.0: no length, ends by closing, like a piece still being produced
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"x" * 5000)
+        up = ThreadingHTTPServer(("127.0.0.1", 0), Up)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        px = StreamProxy()
+        try:
+            local = px.add_live(f"http://127.0.0.1:{up.server_address[1]}/a/seg.ts", {})
+            r = urllib.request.urlopen(local, timeout=5)
+            self.assertEqual(r.headers.get("Content-Length"), "5000")        # ffmpeg treats a piece with no length as cut short
+            self.assertEqual(len(r.read()), 5000)
+        finally:
+            px.stop()
+            up.shutdown()
