@@ -149,6 +149,115 @@ def find_ytdlp() -> str:
 
 # ---------------------------------------------------------------------------------------------- shaping data
 
+_URL = re.compile(r"https?://[^\s<>\"']+")
+_STAMP = re.compile(r"(?<![\w:/.#=&?-])((?:\d{1,2}:)?\d{1,2}:\d{2})(?![\w:])")
+
+
+def stamp_seconds(text: str) -> int:
+    """\"1:02:03\" or \"12:34\" -> seconds."""
+    n = 0
+    for part in text.split(":"):
+        n = n * 60 + int(part)
+    return n
+
+
+def describe_html(text: str) -> str:
+    """A description or comment as the small HTML the player shows: web addresses become links, and times like 12:34 become
+    seek:<seconds> links that jump the video there."""
+    import html
+    out = []
+    pos = 0
+    for m in _URL.finditer(text or ""):
+        out.append(_stamps(html.escape(text[pos:m.start()])))
+        url = m.group(0).rstrip(".,;:!?)")
+        out.append(f'<a href="{html.escape(url)}">{html.escape(url)}</a>' + html.escape(m.group(0)[len(url):]))
+        pos = m.end()
+    out.append(_stamps(html.escape((text or "")[pos:])))
+    return "".join(out).replace("\r\n", "\n").replace("\n", "<br>")
+
+
+def _stamps(escaped: str) -> str:
+    return _STAMP.sub(lambda m: f'<a href="seek:{stamp_seconds(m.group(1))}">{m.group(1)}</a>', escaped)
+
+
+def chapters_from(d: dict) -> list[dict]:
+    """[{title, start}] from yt-dlp's chapter list (empty for videos without chapters and for live streams)."""
+    out = []
+    for c in d.get("chapters") or []:
+        try:
+            out.append({"title": str(c.get("title") or "").strip() or "Chapter", "start": float(c.get("start_time") or 0)})
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def comments_from(d: dict, limit: int = 60) -> list[dict]:
+    """Top-level comments from yt-dlp's JSON, pinned first, then in the order YouTube gave them."""
+    rows = []
+    for c in d.get("comments") or []:
+        if c.get("parent") not in (None, "root"):
+            continue
+        rows.append({"id": c.get("id") or "", "author": (c.get("author") or "").lstrip("@") or "Someone",
+                     "html": describe_html(c.get("text") or ""), "likes": int(c.get("like_count") or 0),
+                     "ago": c.get("_time_text") or "", "pinned": bool(c.get("is_pinned")),
+                     "uploader": bool(c.get("author_is_uploader")), "thumb": c.get("author_thumbnail") or ""})
+    rows.sort(key=lambda r: not r["pinned"])
+    return rows[:limit]
+
+
+def upload_text(d: dict) -> str:
+    """\"20261112\" -> \"12 Nov 2026\"."""
+    s = str(d.get("upload_date") or "")
+    if len(s) != 8 or not s.isdigit():
+        return ""
+    import datetime
+    return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:])).strftime("%-d %b %Y")
+
+
+def captions_from(d: dict) -> list[dict]:
+    """The caption tracks a video offers: [{id, lang, auto, label}]. Captions the uploader made come first; of the
+    auto-generated ones only the video's own spoken language is listed (YouTube also offers dozens of machine translations)."""
+    out = []
+    for lang, files in (d.get("subtitles") or {}).items():
+        if lang == "live_chat" or not files:
+            continue
+        name = next((f.get("name") for f in files if f.get("name")), "") or lang
+        out.append({"id": f"s:{lang}", "lang": lang, "auto": False, "label": name})
+    auto = d.get("automatic_captions") or {}
+    own = [k for k in auto if k.endswith("-orig")]
+    if not own and d.get("language") and d["language"] in auto:
+        own = [d["language"]]
+    for lang in own:
+        files = auto[lang]
+        name = next((f.get("name") for f in files if f.get("name")), "") or lang
+        name = re.sub(r"\s*\(?(?:auto-?generated|original)\)?\s*$", "", name, flags=re.I).strip() or lang
+        out.append({"id": f"a:{lang}", "lang": lang, "auto": True, "label": f"{name} (auto-generated)"})
+    return out
+
+
+def unescape_caption(text: str) -> str:
+    """YouTube's caption files write some characters as codes (&gt;&gt; for the >> speaker mark, &amp;, &#39;, &nbsp;): turn them
+    back into the characters, and drop invisible ones that show up as boxes."""
+    import html
+    text = html.unescape(html.unescape(text)).replace("\u00a0", " ")
+    return re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
+
+
+def rolling_to_lines(cues: list) -> list:
+    """YouTube's auto-generated captions scroll: every cue repeats the line before it, with the new words tagged on. Keep each
+    cue's newest line once, shown until the next one arrives."""
+    from .subtitles import Cue
+    out: list = []
+    for c in cues:
+        lines = [ln.strip() for ln in (c.text or "").split("\n") if ln.strip()]
+        if not lines or lines[-1] == (out[-1].text if out else None):
+            continue
+        out.append(Cue(c.start, c.end, lines[-1]))
+    for a, b in zip(out, out[1:]):
+        a.end = min(max(a.end, a.start + 1.0), b.start) if b.start > a.start else a.end
+    return out
+
+
 def thumb_for(vid: str) -> str:
     return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
 
@@ -413,6 +522,44 @@ class YtDlp:
         out = self._run(cmd)
         return json.loads(out) if out.strip() else {}
 
+    def caption_cues(self, video_id: str, lang: str, auto: bool) -> list:
+        """Download one caption track with yt-dlp (into the cache folder) and return its cues."""
+        from . import subtitles
+        folder = cache_dir() / "captions"
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in sorted(folder.glob("*"), key=lambda f: f.stat().st_mtime, reverse=True)[40:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        want = folder / f"{video_id}.{lang}.vtt"
+        if not want.exists() or want.stat().st_size < 20:
+            cmd = [self.exe, "--skip-download", "--no-playlist", "--force-ipv4", "-q", "--no-warnings",
+                   "--write-auto-subs" if auto else "--write-subs", "--sub-langs", lang, "--sub-format", "vtt",
+                   "-o", str(folder / "%(id)s.%(ext)s"), f"https://www.youtube.com/watch?v={video_id}"]
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as e:
+                raise RuntimeError(f"Couldn’t run yt-dlp: {e}")
+            if not want.exists():
+                msg = (p.stderr.strip().splitlines() or ["YouTube didn’t give out that caption file."])[-1]
+                raise RuntimeError(msg[:160])
+        cues = subtitles.parse(want.read_text(encoding="utf-8", errors="replace"), "x.vtt")
+        for c in cues:
+            c.text = unescape_caption(c.text)
+        if auto:
+            cues = rolling_to_lines(cues)
+        if not cues:
+            raise RuntimeError("That caption track is empty.")
+        return cues
+
+    def comments(self, video_id: str, n: int = 40) -> list[dict]:
+        """The top comments of a video (no replies). A separate, slower request, so it is made only when they are wanted."""
+        d = self._json("--dump-single-json", "--no-playlist", "--skip-download", "--write-comments", "--force-ipv4",
+                       "--extractor-args", f"youtube:max_comments={n},{n},0,0;comment_sort=top",
+                       f"https://www.youtube.com/watch?v={video_id}")
+        return comments_from(d, n)
+
     def search(self, query: str, n: int = 24) -> list[dict]:
         d = self._json("--flat-playlist", "--dump-single-json", f"ytsearch{n}:{query}")
         return [v for v in (norm_video(e) for e in entries(d)) if v]
@@ -511,7 +658,9 @@ class YtDlp:
                 "url": url, "headers": d.get("http_headers") or {}, "dur": float(d.get("duration") or 0),
                 "thumb": d.get("thumbnail") or thumb_for(video_id), "live": bool(d.get("is_live")),
                 "size": int(d.get("filesize") or 0), "size_hint": int(d.get("filesize") or d.get("filesize_approx") or 0),
-                "levels": levels_from(d), "res": (min(d["width"], d["height"]) if d.get("width") and d.get("height") else 360)}
+                "levels": levels_from(d), "res": (min(d["width"], d["height"]) if d.get("width") and d.get("height") else 360),
+                "desc": describe_html(d.get("description") or ""), "chapters": chapters_from(d),
+                "views": int(d.get("view_count") or 0), "uploaded": upload_text(d), "captions": captions_from(d)}
 
     _client = ""
     keep = 3                                    # how many fetched videos stay in the cache
@@ -586,9 +735,8 @@ class YtDlp:
             if waited or self.retry_wait <= 0:
                 return False
             waited = True
-            print(f"[youtube] {video_id}: refused; waiting {self.retry_wait:g}s and trying once more", file=sys.stderr, flush=True)
-            time.sleep(self.retry_wait)
-            return probe(info)
+            print(f"[youtube] {video_id}: refused; checking again for up to {self.retry_wait:g}s", file=sys.stderr, flush=True)
+            return self._probe_again(probe, info)
         # Without your login first: some clients (android_vr) work best anonymously and stop working when cookies are sent.
         # Then, if you chose a browser, the same clients again with its login.
         for with_login in ([False, True] if self.browser else [False]):
@@ -662,7 +810,7 @@ class YtDlp:
             print(f"[youtube] {video_id}: direct {want}p fetch failed ({str(e)[:100]}); using the full lookup", file=sys.stderr, flush=True)
             return self.resolve(video_id, quality=quality, speed=speed, fast=False)
 
-    _audio_good = ""        # the player client that last gave a working audio address
+    _audio_good = ""        # the player client that last gave a working audio address (the default client gives audio-only m4a; android_vr only gives a video file)
 
     # ---- audio only, for YouTube Music --------------------------------------------------------------------
     def _attempt_audio(self, video_id: str, client: str, with_login: bool) -> dict:
@@ -683,6 +831,17 @@ class YtDlp:
                 "url": url, "headers": d.get("http_headers") or {}, "dur": float(d.get("duration") or 0),
                 "thumb": d.get("thumbnail") or "", "live": False, "size_hint": int(d.get("filesize") or d.get("filesize_approx") or 0),
                 "audio": True}
+
+    def _probe_again(self, probe: Callable[[dict], bool], info: dict) -> bool:
+        """A brand-new address is sometimes refused for a moment. Ask again every 0.7 s for up to `retry_wait` seconds and
+        stop at the first yes, instead of always sleeping the whole time."""
+        deadline = time.monotonic() + self.retry_wait
+        while True:
+            time.sleep(max(0.0, min(0.7, deadline - time.monotonic())))
+            if probe(info):
+                return True
+            if time.monotonic() >= deadline:
+                return False
 
     def resolve_audio(self, video_id: str, probe: Callable[[dict], bool] | None = None) -> dict:
         """The audio stream of one track: {id, url, headers, dur, ...}, or {file: ...} when yt-dlp had to download it.
@@ -708,10 +867,9 @@ class YtDlp:
                     return info
                 if not waited and self.retry_wait > 0:
                     waited = True
-                    print(f"[youtube] {video_id}: audio address refused; waiting {self.retry_wait:g}s and trying once more",
+                    print(f"[youtube] {video_id}: audio address refused; checking again for up to {self.retry_wait:g}s",
                           file=sys.stderr, flush=True)
-                    time.sleep(self.retry_wait)
-                    if probe(info):
+                    if self._probe_again(probe, info):
                         self._audio_good = client
                         return info
                 print(f"[youtube] {video_id}: audio client={self._client or 'default'} address refused", file=sys.stderr, flush=True)
@@ -949,6 +1107,7 @@ class Store:
         self.cache = "3"                             # "1" | "3" | "10" | "exit" (keep 3, wipe when Marquee closes)
         self.list_mode = False                       # Subscriptions / Recommended shown as a list
         self.fast = True                             # start at 360p at once and upgrade in the background
+        self.caption_lang = ""                       # the caption language last chosen ("en"), picked again on the next video that has it
         self.positions: dict[str, dict] = {}        # video id -> {pos, dur, t}: where you stopped watching
         try:
             d = json.loads(self._file.read_text())
@@ -956,6 +1115,7 @@ class Store:
             self.quality = d.get("quality", "auto") if d.get("quality", "auto") in QUALITIES else "auto"
             self.speed = float(d.get("speed", 0) or 0)
             self.fast = bool(d.get("fast", True))
+            self.caption_lang = str(d.get("caption_lang", "") or "")
             self.list_mode = bool(d.get("list_mode", False))
             self.cache = d.get("cache", "3") if d.get("cache", "3") in ("1", "3", "10", "exit") else "3"
             self.subs = [s for s in d.get("subs", []) if s.get("id")]
@@ -969,7 +1129,7 @@ class Store:
             self._file.parent.mkdir(parents=True, exist_ok=True)
             self._file.write_text(json.dumps({"subs": self.subs, "history": self.history, "browser": self.browser,
                                                       "quality": self.quality, "speed": self.speed, "fast": self.fast, "cache": self.cache, "list_mode": self.list_mode,
-                                                      "positions": self.positions}, indent=1))
+                                                      "positions": self.positions, "caption_lang": self.caption_lang}, indent=1))
         except OSError:
             pass
 
@@ -1038,6 +1198,10 @@ class Store:
 
     def resume_at(self, vid: str) -> float:
         return float(self.positions.get(vid, {}).get("pos", 0.0))
+
+    def set_caption_lang(self, lang: str) -> None:
+        self.caption_lang = lang
+        self.save()
 
     def set_quality(self, q: str) -> None:
         self.quality = q if q in QUALITIES else "auto"

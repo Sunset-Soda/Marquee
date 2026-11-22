@@ -2681,3 +2681,70 @@ class LiveProxyTests(unittest.TestCase):
         finally:
             px.stop()
             up.shutdown()
+
+
+class YoutubeInfoTests(unittest.TestCase):
+    def test_description_links_and_times(self):
+        from marquee.core import youtube as y
+        h = y.describe_html("0:00 Intro\n1:02:03 Part two <b>\nsee https://example.com/a?t=1:30. ok")
+        self.assertIn('<a href="seek:0">0:00</a>', h)
+        self.assertIn('<a href="seek:3723">1:02:03</a>', h)
+        self.assertIn('<a href="https://example.com/a?t=1:30">https://example.com/a?t=1:30</a>.', h)   # the time inside the address stays put
+        self.assertIn("&lt;b&gt;", h)                                                                    # markup in the text is escaped
+        self.assertIn("<br>", h)
+
+    def test_chapters_and_upload_date(self):
+        from marquee.core import youtube as y
+        self.assertEqual(y.chapters_from({"chapters": [{"title": "Intro", "start_time": 0}, {"title": "", "start_time": 61.5}]}),
+                         [{"title": "Intro", "start": 0.0}, {"title": "Chapter", "start": 61.5}])
+        self.assertEqual(y.chapters_from({}), [])
+        self.assertEqual(y.upload_text({"upload_date": "20261112"}), "12 Nov 2026")
+        self.assertEqual(y.upload_text({}), "")
+
+    def test_comments_keep_top_level_pinned_first(self):
+        from marquee.core import youtube as y
+        d = {"comments": [{"id": "a", "text": "first 1:00", "author": "@Ann", "like_count": 3, "parent": "root"},
+                          {"id": "b", "text": "reply", "author": "Bob", "parent": "a"},
+                          {"id": "c", "text": "pinned", "author": "Cy", "parent": "root", "is_pinned": True, "author_is_uploader": True}]}
+        rows = y.comments_from(d)
+        self.assertEqual([r["id"] for r in rows], ["c", "a"])
+        self.assertEqual(rows[1]["author"], "Ann")
+        self.assertIn("seek:60", rows[1]["html"])
+        self.assertTrue(rows[0]["uploader"])
+
+
+class YoutubeCaptionTests(unittest.TestCase):
+    def test_tracks_offered(self):
+        from marquee.core import youtube as y
+        got = y.captions_from({"subtitles": {"en": [{"name": "English"}], "live_chat": [{"name": "Live chat"}]},
+                               "automatic_captions": {"en-orig": [{"name": "English (Original)"}], "fr": [{"name": "French"}]}})
+        self.assertEqual([(t["id"], t["auto"], t["label"]) for t in got],
+                         [("s:en", False, "English"), ("a:en-orig", True, "English (auto-generated)")])
+        self.assertEqual(y.captions_from({}), [])
+        only = y.captions_from({"language": "de", "automatic_captions": {"de": [{"name": "German"}], "en": [{"name": "English"}]}})
+        self.assertEqual([t["id"] for t in only], ["a:de"])
+
+    def test_rolling_auto_captions_show_each_line_once(self):
+        from marquee.core import subtitles as sb, youtube as y
+        vtt = ("WEBVTT\n\n00:00:01.000 --> 00:00:03.000 align:start position:0%\nhello<00:00:01.500><c> and</c>\n\n"
+               "00:00:03.000 --> 00:00:03.010\nhello and\n\n00:00:03.010 --> 00:00:05.000\nhello and\nto<00:00:03.500><c> you</c>\n\n"
+               "00:00:05.000 --> 00:00:05.010\nto you\n")
+        got = y.rolling_to_lines(sb.parse(vtt, "x.vtt"))
+        self.assertEqual([c.text for c in got], ["hello and", "to you"])
+
+    def test_caption_language_is_remembered(self):
+        import tempfile
+        from pathlib import Path
+        from marquee.core import youtube as y
+        with tempfile.TemporaryDirectory() as d:
+            st = y.Store(Path(d))
+            st.set_caption_lang("fr")
+            self.assertEqual(y.Store(Path(d)).caption_lang, "fr")
+
+
+class CaptionTextTests(unittest.TestCase):
+    def test_codes_become_characters(self):
+        from marquee.core import youtube as y
+        self.assertEqual(y.unescape_caption("&gt;&gt; Tom &amp; Jerry&#39;s&nbsp;show"), ">> Tom & Jerry's show")
+        self.assertEqual(y.unescape_caption("a\u200bb\u00a0c"), "ab c")
+        self.assertEqual(y.unescape_caption("[Music] ♪"), "[Music] ♪")
