@@ -19,8 +19,8 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 - **Subtitles:** files beside the video, tracks inside it, automatic download from OpenSubtitles (Subdl as a backup) and automatic syncing to the speech.
 
 **Online, no account needed**
-- **YouTube:** search, channels, playlists, subscriptions (Google Takeout import), history, a quality menu with Auto, fast start, and SponsorBlock to skip sponsor reads.
-- **YouTube Music:** songs, albums, artists and playlists in the same mini player, with lyrics and media keys. Needs the `requests` Python package.
+- **YouTube:** search, channels, playlists, subscriptions (Google Takeout import), history, a quality menu with Auto up to 1080p, fast start, and SponsorBlock to skip sponsor reads. Live streams start at the live point (up to 1080p) with a **● Live** button, an **Info** panel shows the description, chapters and comments, and **CC** turns on captions.
+- **YouTube Music:** songs, albums, artists and playlists in the same mini player, with lyrics and media keys. The next song is looked up while one plays, so it starts straight away. Needs the `requests` Python package.
 - **YouTube Shorts:** a vertical feed with auto-scroll, a "For you" mix, and "More like this".
 - **Podcasts:** search, subscribe by name, RSS link or Apple Podcasts link, resume where you stopped, and playback speed.
 - **Live TV:** M3U playlists with an XMLTV guide, and the largest picture size the stream offers.
@@ -179,8 +179,9 @@ Choose **YouTube** in the sidebar. It works like FreeTube: no account, nothing i
 what a normal video request needs. Search videos or channels, subscribe to channels (kept on this computer), see a
 feed of their latest videos, and keep a watch history. Videos play in Marquee's own player.
 
-It needs **yt-dlp** installed (`sudo pacman -S yt-dlp`). Streams are the combined video+audio formats YouTube offers,
-usually up to 720p.
+It needs **yt-dlp** installed (`sudo pacman -S yt-dlp`). Videos start at 360p so they open at once, then swap to the
+bigger picture when it has downloaded (the quality box says "getting 1080p…" while that happens, and a refused download
+is tried again).
 
 **Import your subscriptions:** use the toolbar's *Import Subscriptions…* and pick `subscriptions.csv` from a Google
 Takeout export (YouTube and YouTube Music › subscriptions). Channels already subscribed are skipped.
@@ -194,6 +195,32 @@ needs **deno** and **yt-dlp-ejs** installed.
 **Recommended tab (optional):** in Settings › YouTube pick the browser you are signed in to YouTube with. Marquee
 then reads that browser's login through yt-dlp to fetch your home-page recommendations. This hands Marquee your
 YouTube session and YouTube may flag automated use, so it is off by default.
+
+### Live streams
+
+Live YouTube streams play in the same player. They start at the live point, at up to 1080p when the stream offers it,
+and keep going: YouTube only honours a live address for about 25 seconds, so Marquee quietly swaps in a fresh one about every
+ten seconds behind the scenes. Expect to be roughly 10 to 20 seconds behind the broadcaster. A short pause carries on
+where you stopped; after a long pause (over 15 seconds) Marquee jumps back to live, and the **● Live** button next to the
+quality box takes you there any time. If a stream stalls, Marquee restarts it for you.
+
+### Info panel
+
+Press **Info** in the player (or **I**) to open a panel beside the picture:
+
+- **Description:** with clickable links. Times such as `12:34` jump the video to that spot.
+- **Chapters:** a list that follows the video; click one to jump to it.
+- **Comments:** the top comments (pinned first, the uploader's in gold), loaded when you open the tab, since YouTube makes
+  them slow to fetch. Times in comments jump the video too.
+
+Live streams show the description only.
+
+### Captions
+
+Press **CC** (or **C**) to turn on captions. The menu lists the ones the uploader made and the video's own
+auto-generated captions, and remembers your language. They show in the same style as subtitles on your own files, with
+Small, Medium and Large sizes, and stay on when the video swaps to a bigger picture. Captions are off until you turn them
+on, and a video without any says so.
 
 ### SponsorBlock
 
@@ -210,7 +237,8 @@ Choose **YouTube Music** in the sidebar. Search songs, albums, artists and playl
 pages look like the Music tab, and songs play in the mini player with the visualiser, lyrics and media keys. Lyrics come
 from YouTube Music itself when it has them, otherwise from LRCLIB, matched to the length of the audio so the timing
 fits; if a song is still early or late, **[** and **]** nudge the lyrics by 0.1 s and the arrows by the Lyrics button by
-0.5 s, remembered for that song. The next song is looked up while the current one plays, so it starts quickly.
+0.5 s, remembered for that song. The next song is looked up while the current one plays, so it starts quickly; the very
+first song of a session takes a few seconds while YouTube hands out its address.
 
 It uses the same `yt-dlp` setup as YouTube, plus the `requests` package (see Install).
 
