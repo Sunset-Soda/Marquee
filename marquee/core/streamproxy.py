@@ -269,6 +269,57 @@ class _Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
+    def _serve_retimed(self, head: bool, source: str):
+        """A live stream passed through ffmpeg (copying, not re-encoding) so the player gets one plain continuous stream whose
+        clock starts at zero, instead of an HLS playlist whose pieces start hours in. Some Qt/FFmpeg versions never start the
+        clock on those (the picture stays black, nothing plays)."""
+        import os
+        import subprocess
+        import sys
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")         # so a stream that ends (a commercial break, a channel going off air) ends cleanly
+        self.end_headers()
+        self.close_connection = True
+        if head:
+            return
+        exe = ffmpeg_path()
+        if not exe:
+            return
+        cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
+               "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        except OSError as e:
+            print(f"[live] could not start ffmpeg: {e}", file=sys.stderr, flush=True)
+            return
+        threading.Thread(target=lambda: [print(f"[live] ffmpeg: {ln.decode('utf-8', 'replace').rstrip()}", file=sys.stderr, flush=True)
+                                         for ln in proc.stderr], daemon=True).start()
+        total = 0
+        try:
+            fd = proc.stdout.fileno()
+            while True:
+                data = os.read(fd, 64 * 1024)
+                if not data:
+                    self.wfile.write(b"0\r\n\r\n")                # the closing chunk: the stream really did end
+                    self.wfile.flush()
+                    break
+                if not total:
+                    print("[live] ffmpeg is passing the stream through", file=sys.stderr, flush=True)
+                total += len(data)
+                self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+                self.wfile.flush()
+        except (OSError, ValueError):                            # the player closed the connection (stop, or a new channel)
+            pass
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            print(f"[live] ffmpeg pass-through ended after {total // 1024} KB", file=sys.stderr, flush=True)
+
     def _serve(self, head: bool):
         entry = self.server.entries.get(self.path.split("?")[0].strip("/").split("/")[0])     # type: ignore[attr-defined]
         if not entry:
@@ -279,6 +330,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if entry[0] == "hls":
             self._serve_hls(head, entry[1], entry[2], entry[3])
+            return
+        if entry[0] == "retime":
+            self._serve_retimed(head, entry[1])
             return
         if entry[0] == "live":
             self._maybe_refresh_live(self.path.split("?")[0].strip("/").split("/")[0])
@@ -365,6 +419,17 @@ class _Handler(BaseHTTPRequestHandler):
         self._serve(True)
 
 
+def ffmpeg_path() -> str | None:
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+def retime_enabled() -> bool:
+    """Live streams go through ffmpeg first, when ffmpeg is installed. Set MARQUEE_LIVE_VIA_FFMPEG=0 to hand them to the player directly."""
+    import os
+    return os.environ.get("MARQUEE_LIVE_VIA_FFMPEG") != "0" and bool(ffmpeg_path())
+
+
 class StreamProxy:
     def __init__(self):
         self._server: ThreadingHTTPServer | None = None
@@ -409,6 +474,16 @@ class StreamProxy:
         token = f"s{self._n}"
         s.entries[token] = ("file", path, size, proc)            # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}"
+
+    def retimed(self, local_url: str) -> str:
+        """`local_url` (one of this proxy's own addresses) passed through ffmpeg so it starts at time zero; unchanged when that is switched off."""
+        if not retime_enabled():
+            return local_url
+        s = self._start()
+        self._n += 1
+        token = f"r{self._n}"
+        s.entries[token] = ("retime", local_url)                  # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}/live.ts"
 
     def add_hls(self, url: str, part: str, state) -> str:
         """The local address of the channel ("main") or the current commercial break ("ad") of a live playlist; `state` is a core.twitch.AdState."""

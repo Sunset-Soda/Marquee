@@ -30,6 +30,21 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
     from .twitch_ctl import TwitchController
     from .ytmusic_ctl import YtMusicController
 
+    # Send everything Qt and QML print (console.log included) through Python's stderr, so it reaches the log file as well as
+    # the terminal. Qt's own handler shows the console.log lines on the terminal but they never made it into the file.
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+
+        def _qt_message(mode, context, message):
+            try:
+                cat = getattr(context, "category", None) or "default"
+                print((f"{cat}: " if cat != "default" else "") + str(message), file=sys.stderr, flush=True)
+            except Exception:
+                pass
+        qInstallMessageHandler(_qt_message)
+    except Exception:
+        pass
+
     # QApplication (not QGuiApplication) so Kirigami can load qqc2-desktop-style, which draws native Breeze
     # controls on Plasma. Qt 6 scales per monitor and fractionally by default; nothing to configure for high DPI.
     try:
