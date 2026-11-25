@@ -15,6 +15,7 @@ import re
 import sys
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -315,12 +316,22 @@ def norm_playlist(d: dict) -> dict | None:
             "channel": d.get("channel") or d.get("uploader") or ""}
 
 
+_DASH_GUARD = threading.Lock()
+_DASH_BUSY: dict[str, threading.Lock] = {}      # "<id>-<size>p" -> held while that file is being downloaded
+
+
+def dash_in_use(f: Path) -> bool:
+    """True for a file that is being downloaded right now (the cache clean-up must leave it alone)."""
+    with _DASH_GUARD:
+        return any(lock.locked() and f.name.startswith(key) for key, lock in _DASH_BUSY.items())
+
+
 def clear_cache(keep: str = "") -> tuple[int, int]:
     """Delete the saved videos (except the file named `keep`). Returns (files removed, bytes freed)."""
     n = freed = 0
     folder = cache_dir() / "youtube"
     for f in folder.glob("*") if folder.exists() else []:
-        if str(f) == keep or not f.is_file():
+        if str(f) == keep or not f.is_file() or dash_in_use(f):
             continue
         try:
             size = f.stat().st_size
@@ -953,7 +964,20 @@ class YtDlp:
         raise RuntimeError("yt-dlp took too long to start fetching this video.")
 
     def fetch_dash(self, video_id: str, meta: dict, res: int = 480) -> dict:
-        """Download the separate picture and sound streams, joined into one file (this takes a while: it is a real download)."""
+        """Download the separate picture and sound streams, joined into one file (this takes a while: it is a real download).
+
+        Only one download of a given video and size runs at a time: opening the same video again while its big file is still
+        coming waits for that download and then plays the finished file, instead of starting a second one that deletes the first's
+        half-written file."""
+        key = f"{video_id}-{res}p"
+        with _DASH_GUARD:
+            lock = _DASH_BUSY.setdefault(key, threading.Lock())
+        if lock.locked():
+            print(f"[youtube] {video_id}: the {res}p file is already being fetched; waiting for it", file=sys.stderr, flush=True)
+        with lock:
+            return self._fetch_dash(video_id, meta, res)
+
+    def _fetch_dash(self, video_id: str, meta: dict, res: int) -> dict:
         folder = cache_dir() / "youtube"
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / f"{video_id}-{res}p.mp4"
@@ -964,7 +988,7 @@ class YtDlp:
             print(f"[youtube] {video_id}: reusing the {res}p file from earlier", file=sys.stderr, flush=True)
             return dict(meta, file=str(target), size=size, proc=None, headers={}, res=res, speed=0.0)
         # keep the newest few (the setting); the file being fetched is one of them
-        for old in sorted((f for f in folder.glob("*") if f != target), key=lambda f: f.stat().st_mtime, reverse=True)[max(0, self.keep - 1):]:
+        for old in sorted((f for f in folder.glob("*") if f != target and not dash_in_use(f)), key=lambda f: f.stat().st_mtime, reverse=True)[max(0, self.keep - 1):]:
             try:
                 old.unlink()
             except OSError:

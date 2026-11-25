@@ -1512,6 +1512,46 @@ class YoutubeQualityTests(unittest.TestCase):
             self.assertEqual(got["file"], str(other))
             self.assertTrue(playing.exists())
 
+    def test_dash_downloads_of_one_video_do_not_overlap_or_delete_each_other(self):
+        import threading
+        import time as _time
+        from unittest import mock
+        running, most = [0], [0]
+
+        def slow(self_, vid, meta, res):
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+            _time.sleep(0.2)
+            running[0] -= 1
+            return {"file": "f"}
+        with mock.patch.object(youtube.YtDlp, "_fetch_dash", slow):
+            dl = youtube.YtDlp(exe="yt-dlp")
+            ts = [threading.Thread(target=dl.fetch_dash, args=("same", {}, 1080)) for _ in range(2)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        self.assertEqual(most[0], 1)                     # the second waited for the first
+        # a file that is being downloaded survives another video's clean-up
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d) / "youtube"
+            folder.mkdir()
+            busy = folder / "big-1080p.temp.mp4"
+            busy.write_bytes(b"x")
+            with youtube._DASH_GUARD:
+                lock = youtube._DASH_BUSY.setdefault("big-1080p", threading.Lock())
+            lock.acquire()
+            try:
+                with mock.patch.object(youtube, "cache_dir", return_value=Path(d)), \
+                        mock.patch.object(youtube.subprocess, "Popen", side_effect=OSError("no yt-dlp")):
+                    dl = youtube.YtDlp(exe="yt-dlp")
+                    dl.keep = 1
+                    with self.assertRaises(RuntimeError):
+                        dl.fetch_dash("other", {"dur": 10}, 720)
+                    self.assertTrue(busy.exists())
+                    self.assertEqual(youtube.clear_cache()[0], 0)
+                    self.assertTrue(busy.exists())
+            finally:
+                lock.release()
+
     def test_fast_start(self):
         import json as _json
         d = {"id": "abcdefghijk", "title": "T", "duration": 100, "url": "https://x.test/v", "format_id": "18", "ext": "mp4",
