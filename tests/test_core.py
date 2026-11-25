@@ -432,6 +432,29 @@ class ShowTests(unittest.TestCase):
         self.assertIn("No TV match for “Obscure Show”", msg)
 
 
+class WikiPosterTests(unittest.TestCase):
+    def test_reads_the_poster_from_the_film_infobox(self):
+        from marquee.core import artwork, net
+        item = library.Item(id="m1", title="Furious 7", sub="2015", kind="movie")
+        seen = []
+
+        def get(url, *a, **k):
+            seen.append(url)
+            if "list=search" in url:
+                return json.dumps({"query": {"search": [{"title": "Furious 7 (soundtrack)"}, {"title": "Furious 7"}]}}).encode()
+            body = "{{Infobox film\n| name = Furious 7\n| image = Furious 7 poster.jpg\n| released = {{Film date|2015|04|01}}\n}}"
+            if "Soundtrack" in url or "soundtrack" in url:
+                body = "{{Infobox album\n| name = x\n}}"
+            return json.dumps({"query": {"pages": [{"revisions": [{"slots": {"main": {"content": body}}}]}]}}).encode()
+        old = net.get
+        net.get = get
+        try:
+            url = artwork.wiki_poster(item)
+        finally:
+            net.get = old
+        self.assertTrue(url.endswith("Special:FilePath/Furious_7_poster.jpg?width=600"), url)
+
+
 class SubtitleTests(unittest.TestCase):
     SRT = ("\ufeff1\r\n00:00:00,500 --> 00:00:02,500\r\nHello <i>world</i>\r\n\r\n"
            "2\r\n00:00:03,000 --> 00:00:03,800\r\n<font color=red>Second</font>\r\nline\r\n")

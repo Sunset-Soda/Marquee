@@ -779,7 +779,11 @@ class YtDlp:
             except RuntimeError as e:
                 print(f"[youtube] {video_id}: single-file version failed ({str(e)[:100]}); trying separate picture and sound streams",
                       file=sys.stderr, flush=True)
-                return self.fetch_dash(video_id, meta, max(want, 480))
+                # The first lookup got no list of sizes (so `want` is still the 360 it started at). Don't quietly fall to 480:
+                # use the size chosen in Settings, or for Auto what the video's length and your speed allow.
+                size = max(want, 480) if want > 360 else self.short_level(quality, float(meta.get("dur") or 0), speed)
+                print(f"[youtube] {video_id}: no size list from YouTube; fetching {size}p (quality {quality})", file=sys.stderr, flush=True)
+                return self.fetch_dash(video_id, meta, size)
         raise RuntimeError("YouTube won’t let Marquee stream this particular video (every address was refused, HTTP 403). "
                            "Other videos should still play. " + (self.diagnose(video_id) or "").strip())
 
