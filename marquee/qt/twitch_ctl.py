@@ -310,7 +310,7 @@ class TwitchController(QObject):
                 starts_in_ad = state.open(text, info["url"])
                 px = self._yt._proxy
                 self._ads = state
-                info = dict(info, raw=info["url"], startsInAd=starts_in_ad, adUrl=px.add_hls(info["url"], "ad", state), url=px.add_hls(info["url"], "main", state))
+                info = dict(info, raw=info["url"], startsInAd=starts_in_ad, adUrl=px.retimed(px.add_hls(info["url"], "ad", state)), url=px.retimed(px.add_hls(info["url"], "main", state)))
                 if starts_in_ad:
                     _log(f"{login}: the stream opens with a commercial break; playing it, then the channel")
             except Exception as e:
