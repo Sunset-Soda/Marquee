@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
@@ -27,18 +28,61 @@ def searchable(item: Item) -> bool:
     return item.kind in LOOKUP and not item.sample and not item.node
 
 
+def _terms(item: Item) -> list[str]:
+    """What to search for, most specific first: "Title Year", then just the title (a wrong year finds nothing)."""
+    if item.kind == "music":
+        return [" ".join(x for x in (item.sub, item.title) if x)]
+    title = re.sub(r"[._]+", " ", item.title).strip()
+    terms = []
+    if item.kind == "movie" and re.fullmatch(r"\d{4}", item.sub or ""):
+        terms.append(f"{title} {item.sub}")
+    terms.append(title)
+    return terms
+
+
 def lookup_url(item: Item) -> str | None:
     media, entity = LOOKUP[item.kind]
-    if item.kind == "music":
-        term = " ".join(x for x in (item.sub, item.title) if x)
-    else:
-        term = item.title + (" " + item.sub if item.kind == "movie" and re.fullmatch(r"\d{4}", item.sub) else "")
-    query = urllib.parse.urlencode({"term": term, "media": media, "entity": entity, "limit": "5"})
-    data = json.loads(net.get("https://itunes.apple.com/search?" + query))
-    for hit in data.get("results", []):
-        art = hit.get("artworkUrl100") or hit.get("artworkUrl60")
-        if art:
-            return re.sub(r"/\d+x\d+bb", "/600x600bb", art)
+    for term in _terms(item):
+        query = urllib.parse.urlencode({"term": term, "media": media, "entity": entity, "limit": "5"})
+        data = json.loads(net.get("https://itunes.apple.com/search?" + query))
+        for hit in data.get("results", []):
+            art = hit.get("artworkUrl100") or hit.get("artworkUrl60")
+            if art:
+                return re.sub(r"/\d+x\d+bb", "/600x600bb", art)
+    return None
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def wiki_poster(item: Item) -> str | None:
+    """A second place to look for a movie poster, for when iTunes has none: the poster named in the infobox of the film's
+    Wikipedia article. (The API's own "page image" leaves film posters out, so the infobox is read instead.)
+
+    An article is used only if it is a film article and either mentions the movie's year or has every word of its title,
+    so a different film is not mistaken for it."""
+    title = re.sub(r"[._]+", " ", item.title).strip()
+    year = item.sub if re.fullmatch(r"\d{4}", item.sub or "") else ""
+    api = "https://en.wikipedia.org/w/api.php?"
+    found = json.loads(net.get(api + urllib.parse.urlencode({
+        "action": "query", "format": "json", "list": "search", "srlimit": "4", "srsearch": f"{title} {year} film".strip()})))
+    want = _words(title)
+    for hit in (found.get("query") or {}).get("search") or []:
+        name = hit.get("title", "")
+        page = json.loads(net.get(api + urllib.parse.urlencode({
+            "action": "query", "format": "json", "formatversion": "2", "prop": "revisions", "rvprop": "content",
+            "rvslots": "main", "rvsection": "0", "titles": name})))
+        pages = (page.get("query") or {}).get("pages") or [{}]
+        revs = pages[0].get("revisions") or [{}]
+        text = ((revs[0].get("slots") or {}).get("main") or {}).get("content", "")
+        if "infobox film" not in text.lower():
+            continue
+        if not ((year and year in text) or (want and want <= _words(name))):
+            continue
+        m = re.search(r"\|\s*image\s*=\s*(?:\[\[)?(?:(?:File|Image):)?([^\n|\]]+\.(?:jpe?g|png|webp))", text, re.I)
+        if m:
+            return "https://en.wikipedia.org/wiki/Special:FilePath/" + urllib.parse.quote(m.group(1).strip().replace(" ", "_")) + "?width=600"
     return None
 
 
@@ -48,14 +92,20 @@ def fetch_cover(item: Item, library: Library) -> str:
         return "skip"
     try:
         url = lookup_url(item)
+        src = "iTunes"
+        if not url and item.kind == "movie":
+            url, src = wiki_poster(item), "Wikipedia"
         item.cover_tried = True
+        print(f"[artwork] {item.kind} {item.title!r} ({item.sub}): {'found on ' + src if url else 'nothing found'}",
+              file=sys.stderr, flush=True)
         if not url:
             library.save()
             return "none"
         library.set_cover_bytes(item, net.get(url))
         library.save()
         return "ok"
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+        print(f"[artwork] {item.kind} {item.title!r}: lookup failed: {e}", file=sys.stderr, flush=True)
         return "error"
 
 
