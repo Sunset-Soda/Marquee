@@ -752,6 +752,13 @@ class YoutubeController(QObject):
         c = self._comments.get(self._comments_for) or {"state": "", "items": [], "error": ""}
         return {"id": self._comments_for, **c}
 
+    @Slot(str, result="QVariantMap")
+    def dvrStatus(self, video_id: str):
+        """For a live stream that is being recorded so it can be paused and rewound: {oldest, live, viewerStart, alive}, in seconds
+        from the start of the recording. {} when it is not being recorded."""
+        info = self._c.yt_info.get(f"yt:{video_id}") or {}
+        return self._proxy.dvr_status(info.get("url", "")) or {}
+
     def _live_address(self, video_id: str):
         """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""
         good = getattr(self, "_live_client", "") or self._dlp._client.replace("+login", "")
@@ -783,9 +790,11 @@ class YoutubeController(QObject):
             "id": f"yt:{vid}", "title": info["title"] or known.get("title", ""), "sub": info["channel"] or known.get("channel", ""),
             "levels": [l["res"] for l in info.get("levels", []) if 360 <= l["res"] <= 1080], "res": info.get("res", 360),
             "quality": self._store.quality, "upgradeTo": (up or {}).get("res", 0), "media": "video", "url": (self._proxy.add_file(info["file"], info.get("size", 0), info.get("proc")) if info.get("file")
-                    else self._proxy.retimed(self._proxy.add_live(info["url"], info.get("headers"), refresh=lambda: self._live_address(vid))) if info["live"] else self._proxy.add(info["url"], info.get("headers"))), "exists": True, "pos": self._resume.pop(vid, None) if vid in self._resume else (0.0 if info["live"] else self._store.resume_at(vid)), "dur": info["dur"], "subDelay": 0.0,
-            "cover": info["thumb"], "icon": "video-x-generic", "yt": True, "isLive": info["live"],
+                    else self._proxy.dvr(self._proxy.add_live(info["url"], info.get("headers"), refresh=lambda: self._live_address(vid))) if info["live"] else self._proxy.add(info["url"], info.get("headers"))), "exists": True, "pos": self._resume.pop(vid, None) if vid in self._resume else (0.0 if info["live"] else self._store.resume_at(vid)), "dur": info["dur"], "subDelay": 0.0,
+            "cover": info["thumb"], "icon": "video-x-generic", "yt": True, "isLive": info["live"], "dvr": False,
             "desc": info.get("desc", ""), "chapters": info.get("chapters", []), "captions": info.get("captions", []), "views": info.get("views", 0), "uploaded": info.get("uploaded", "")}
+        made = self._c.yt_info[f"yt:{vid}"]
+        made["dvr"] = bool(info["live"] and self._proxy.dvr_status(made["url"]) is not None)
         row = dict(known) if known else {"id": vid}
         row.update({"id": vid, "title": info["title"] or row.get("title", ""), "channel": info["channel"] or row.get("channel", ""),
                     "thumb": row.get("thumb") or info["thumb"], "dur": info["dur"] or row.get("dur", 0)})
