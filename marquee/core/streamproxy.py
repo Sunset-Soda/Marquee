@@ -422,6 +422,30 @@ class _Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
+    def _watch_client(self, proc) -> None:
+        """Stop `proc` as soon as the player hangs up. Without this a pass-through that is waiting for the stream to say something
+        only finds out the player has gone when it next has data to send, which can be never (a stalled channel)."""
+        import select
+        import socket
+        conn = self.connection
+
+        def watch():
+            while proc.poll() is None:
+                try:
+                    ready, _, _ = select.select([conn], [], [], 1.0)
+                    if ready and conn.recv(1, socket.MSG_PEEK) == b"":
+                        proc.kill()
+                        return
+                    if ready:
+                        time.sleep(0.5)                       # the player sent something more (not a hang-up): keep going
+                except (OSError, ValueError):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    return
+        threading.Thread(target=watch, daemon=True).start()
+
     def _serve_retimed(self, head: bool, source: str):
         """A live stream passed through ffmpeg (copying, not re-encoding) so the player gets one plain continuous stream whose
         clock starts at zero, instead of an HLS playlist whose pieces start hours in. Some Qt/FFmpeg versions never start the
@@ -448,6 +472,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError as e:
             print(f"[live] could not start ffmpeg: {e}", file=sys.stderr, flush=True)
             return
+        self._watch_client(proc)
         threading.Thread(target=lambda: [print(f"[live] ffmpeg: {ln.decode('utf-8', 'replace').rstrip()}", file=sys.stderr, flush=True)
                                          for ln in proc.stderr], daemon=True).start()
         total = 0
@@ -512,6 +537,7 @@ class _Handler(BaseHTTPRequestHandler):
                    "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a:0?",
                    "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+            self._watch_client(proc)
             threading.Thread(target=lambda: [print(f"[dvr] viewer ffmpeg: {ln.decode('utf-8', 'replace').rstrip()}", file=sys.stderr, flush=True)
                                              for ln in proc.stderr], daemon=True).start()
             pr = proc

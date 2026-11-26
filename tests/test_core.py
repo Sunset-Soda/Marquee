@@ -2902,3 +2902,33 @@ class DvrTests(unittest.TestCase):
                     os.environ.pop("XDG_CACHE_HOME", None)
                 else:
                     os.environ["XDG_CACHE_HOME"] = old
+
+
+class PassThroughTests(unittest.TestCase):
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg"), "needs ffmpeg")
+    def test_ffmpeg_stops_when_the_player_leaves_even_if_the_stream_is_silent(self):
+        import socket
+        import subprocess
+        from marquee.core import streamproxy
+        quiet = socket.socket()
+        quiet.bind(("127.0.0.1", 0))
+        quiet.listen(5)
+        port = quiet.getsockname()[1]
+        held = []
+        threading.Thread(target=lambda: [held.append(quiet.accept()) for _ in range(3)], daemon=True).start()   # accepts, never says anything
+        proxy = streamproxy.StreamProxy()
+        try:
+            url = proxy.retimed(f"http://127.0.0.1:{port}/never.m3u8")
+            r = urllib.request.urlopen(url, timeout=10)             # the headers arrive at once
+            time.sleep(1.5)
+            running = lambda: subprocess.run(["pgrep", "-f", f"127.0.0.1:{port}"], capture_output=True).returncode == 0
+            self.assertTrue(running())
+            r.close()                                               # the player goes away; the stream still has nothing to send
+            for _ in range(60):
+                if not running():
+                    break
+                time.sleep(0.1)
+            self.assertFalse(running())
+        finally:
+            proxy.stop()
+            quiet.close()
