@@ -3,7 +3,9 @@ import struct
 import sys
 import random
 import tempfile
+import threading
 import urllib.error
+import urllib.request
 import time
 import unittest
 from pathlib import Path
@@ -2811,3 +2813,92 @@ class CaptionTextTests(unittest.TestCase):
         self.assertEqual(y.unescape_caption("&gt;&gt; Tom &amp; Jerry&#39;s&nbsp;show"), ">> Tom & Jerry's show")
         self.assertEqual(y.unescape_caption("a\u200bb\u00a0c"), "ab c")
         self.assertEqual(y.unescape_caption("[Music] ♪"), "[Music] ♪")
+
+
+class DvrTests(unittest.TestCase):
+    """The recording that lets a live stream be paused, rewound and sent back to live (core/streamproxy.py)."""
+
+    def _dvr(self, d, n=10):
+        from marquee.core.streamproxy import Dvr
+        dvr = Dvr("http://unused", window=3600, folder=d)
+        dvr.proc = type("P", (), {"poll": lambda self: None})()            # looks like a recorder that is running
+        with open(dvr.list, "w") as f:
+            for i in range(n):
+                f.write(f"p{i:06d}.ts,{i * 2.0:.6f},{i * 2.0 + 2:.6f}\n")
+        return dvr
+
+    def test_viewer_joins_behind_live_at_the_right_piece(self):
+        with tempfile.TemporaryDirectory() as d:
+            dvr = self._dvr(d)                                              # pieces cover 0 to 20 seconds
+            self.assertEqual(dvr.begin(0), 9)                               # the live edge: the newest piece
+            self.assertEqual(dvr.viewer_start, 18.0)
+            self.assertEqual(dvr.begin(7), 6)                               # seven seconds behind: the piece holding second 13
+            self.assertEqual(dvr.viewer_start, 12.0)
+            self.assertEqual(dvr.begin(500), 0)                             # further back than there is: the oldest
+            self.assertEqual(dvr.viewer_start, 0.0)
+            self.assertEqual(dvr.status()["live"], 20.0)
+            self.assertTrue(dvr.status()["alive"])
+            self.assertEqual(dvr.piece_after(3), (3, "p000003.ts"))
+            self.assertIsNone(dvr.piece_after(10))                          # not recorded yet
+
+    def test_old_pieces_are_forgotten_without_renumbering(self):
+        with tempfile.TemporaryDirectory() as d:
+            dvr = self._dvr(d)
+            dvr.first = 4                                                   # the pruner deleted the first four pieces
+            self.assertEqual(dvr.status()["oldest"], 8.0)
+            self.assertEqual(dvr.begin(500), 4)                             # numbers still count from the start of the recording
+            self.assertEqual(dvr.piece_after(1), (4, "p000004.ts"))         # a viewer behind the oldest piece catches up to it
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg") and "libx264" in os.popen("ffmpeg -hide_banner -encoders 2>/dev/null").read(),
+                         "needs ffmpeg with libx264")
+    def test_a_paused_viewer_resumes_without_missing_any_picture(self):
+        import functools
+        import http.server
+        import shutil
+        import subprocess
+        from marquee.core import streamproxy
+        old = os.environ.get("XDG_CACHE_HOME")
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["XDG_CACHE_HOME"] = d
+            os.makedirs(os.path.join(d, "src"))
+            src = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25",
+                                    "-f", "lavfi", "-i", "sine=frequency=440", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac",
+                                    "-f", "hls", "-hls_time", "2", "-hls_list_size", "4", "-hls_flags", "delete_segments",
+                                    os.path.join(d, "src", "live.m3u8")])
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=os.path.join(d, "src"))
+            handler.func.log_message = lambda *a: None
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            proxy = streamproxy.StreamProxy()
+            try:
+                time.sleep(3)
+                url = proxy.dvr(f"http://127.0.0.1:{web.server_address[1]}/live.m3u8")
+                r = urllib.request.urlopen(url + "?back=0", timeout=60)
+                got = b""
+                while len(got) < 40000:
+                    got += r.read(8192)
+                time.sleep(11)                              # paused for longer than the source keeps its own pieces (about eight seconds)
+                self.assertTrue(proxy.dvr_status(url)["alive"])
+                t = time.time()
+                while time.time() - t < 4:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    got += chunk
+                r.close()
+                f = os.path.join(d, "got.ts")
+                with open(f, "wb") as fh:
+                    fh.write(got)
+                out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "packet=pts_time", "-of", "csv=p=0", f],
+                                     capture_output=True, text=True).stdout.split()
+                pts = [float(x.split(",")[0]) for x in out if x.strip(",")]
+                self.assertGreater(len(pts), 100)
+                self.assertLess(max(b - a for a, b in zip(pts, pts[1:])), 0.1)      # one picture after another: nothing skipped
+            finally:
+                proxy.stop()
+                src.kill()
+                web.shutdown()
+                if old is None:
+                    os.environ.pop("XDG_CACHE_HOME", None)
+                else:
+                    os.environ["XDG_CACHE_HOME"] = old

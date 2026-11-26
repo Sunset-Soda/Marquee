@@ -6,6 +6,7 @@ with the right headers, passing Range requests through so seeking works.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -18,6 +19,158 @@ _PASS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "La
 
 
 CHUNK = 10 * 1024 * 1024       # YouTube's own players (and yt-dlp) fetch in pieces this size; whole-file requests get a 403
+
+
+class Dvr:
+    """A live stream that is kept on disk while it plays, so it can be paused, rewound and brought back to the live edge.
+
+    One ffmpeg copies the stream (no re-encoding) into short pieces of about two seconds in a folder. Each viewer is another
+    ffmpeg that joins those pieces from any point and hands the player one plain continuous stream whose clock starts at zero.
+    Pausing only stops the viewer; the recording carries on, so resuming carries on from the same picture. Pieces older than
+    `window` seconds are deleted, and the whole folder goes when nobody has been watching for a while."""
+
+    PIECE = 2          # seconds per piece
+    IDLE = 40          # seconds with no viewer before the recording stops
+
+    def __init__(self, source: str, window: float | None = None, folder=None):
+        import os
+        import tempfile
+        from pathlib import Path
+        self.source = source
+        mins = float(os.environ.get("MARQUEE_DVR_MINUTES") or 60)
+        self.window = window if window is not None else mins * 60
+        if folder is None:
+            from .library import cache_dir
+            base = cache_dir() / "live"
+            base.mkdir(parents=True, exist_ok=True)
+            self._sweep(base)
+            folder = tempfile.mkdtemp(prefix="dvr-", dir=base)
+        self.dir = Path(folder)
+        self.list = self.dir / "list.csv"
+        self.proc = None
+        self.lock = threading.Lock()
+        self.viewers = 0
+        self.idle_since = time.monotonic()
+        self.first = 0                       # pieces before this number have been deleted
+        self.viewer_start = 0.0              # where in the recording the newest viewer began
+        self.stopped = False
+
+    @staticmethod
+    def _sweep(base) -> None:
+        """Folders left by an earlier run that was closed without cleaning up."""
+        import shutil
+        for d in base.glob("dvr-*"):
+            try:
+                if time.time() - d.stat().st_mtime > 3600:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
+
+    def pieces(self) -> list:
+        """[(name, start, end)] of the pieces that are complete and still on disk, oldest first."""
+        out = []
+        try:
+            with open(self.list, encoding="utf-8") as f:
+                for line in f:
+                    a = line.strip().split(",")
+                    if len(a) >= 3:
+                        out.append((a[0], float(a[1]), float(a[2])))
+        except (OSError, ValueError):
+            pass
+        return out[self.first:]
+
+    def status(self) -> dict:
+        """{"oldest", "live", "viewerStart", "alive"} in seconds from the start of the recording."""
+        ps = self.pieces()
+        alive = bool(self.proc and self.proc.poll() is None) and not self.stopped
+        return {"oldest": ps[0][1] if ps else 0.0, "live": ps[-1][2] if ps else 0.0, "viewerStart": self.viewer_start, "alive": alive}
+
+    def start(self) -> None:
+        import subprocess
+        import sys
+        with self.lock:
+            if self.proc or self.stopped:
+                return
+            exe = ffmpeg_path()
+            if not exe:
+                return
+            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", self.source, "-map", "0:v:0", "-map", "0:a:0?",
+                   "-c", "copy", "-f", "segment", "-segment_time", str(self.PIECE), "-segment_format", "mpegts",
+                   "-segment_list", str(self.list), "-segment_list_type", "csv", "-segment_list_flags", "live",
+                   str(self.dir / "p%06d.ts")]
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            except OSError as e:
+                print(f"[dvr] could not start ffmpeg: {e}", file=sys.stderr, flush=True)
+                return
+            proc = self.proc
+        threading.Thread(target=lambda: [print(f"[dvr] ffmpeg: {ln.decode('utf-8', 'replace').rstrip()}", file=sys.stderr, flush=True)
+                                         for ln in proc.stderr], daemon=True).start()
+        threading.Thread(target=self._keep, daemon=True).start()
+        print("[dvr] recording the live stream", file=sys.stderr, flush=True)
+
+    def _keep(self) -> None:
+        """Delete pieces older than the window, and stop when nobody has watched for a while."""
+        while not self.stopped:
+            time.sleep(2)
+            if self.viewers == 0 and time.monotonic() - self.idle_since > self.IDLE:
+                self.stop()
+                return
+            ps = self.pieces()
+            if ps:
+                cut = ps[-1][2] - self.window
+                n = 0
+                for name, start, end in ps:
+                    if end < cut:
+                        try:
+                            (self.dir / name).unlink()
+                        except OSError:
+                            pass
+                        n += 1
+                    else:
+                        break
+                self.first += n
+
+    def stop(self) -> None:
+        import shutil
+        import sys
+        if self.stopped:
+            return
+        self.stopped = True
+        p = self.proc
+        if p:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+        print("[dvr] stopped and cleared the recording", file=sys.stderr, flush=True)
+
+    def begin(self, back: float) -> int | None:
+        """The number of the piece a viewer should start from to be `back` seconds behind live, waiting for the first piece to exist."""
+        self.start()
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline and not self.stopped:
+            ps = self.pieces()
+            if ps:
+                live = ps[-1][2]
+                want = max(ps[0][1], live - max(0.0, back))
+                pick = len(ps) - 1 if back <= 0 else next((i for i, pc in enumerate(ps) if pc[2] > want), len(ps) - 1)
+                self.viewer_start = ps[pick][1]
+                return self.first + pick
+            time.sleep(0.25)
+        return None
+
+    def piece_after(self, number: int) -> tuple | None:
+        """The piece with this number (counted from the start of the recording), once it is complete."""
+        if number < self.first:
+            number = self.first                  # it has been deleted: carry on from the oldest left
+        with open(self.list, encoding="utf-8") as f:
+            rows = [ln for ln in f if ln.count(",") >= 2]
+        if number < len(rows):
+            a = rows[number].strip().split(",")
+            return number, a[0]
+        return None
 
 
 class _Server(ThreadingHTTPServer):
@@ -320,6 +473,102 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
             print(f"[live] ffmpeg pass-through ended after {total // 1024} KB", file=sys.stderr, flush=True)
 
+    def _serve_dvr(self, head: bool, token: str):
+        """One viewer of a recorded live stream: joins the pieces `back` seconds behind live and passes them on as one stream."""
+        import os
+        import subprocess
+        import sys
+        from urllib.parse import parse_qs, urlsplit
+        dvr = self.server.dvrs.get(token)                                   # type: ignore[attr-defined]
+        if dvr is None or dvr.stopped:
+            self.send_error(404)
+            return
+        try:
+            back = float(parse_qs(urlsplit(self.path).query).get("back", ["0"])[0])
+        except ValueError:
+            back = 0.0
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.close_connection = True
+        if head:
+            return
+        exe = ffmpeg_path()
+        if not exe:
+            return
+        dvr.viewers += 1
+        proc = None
+        total = 0
+        try:
+            number = dvr.begin(back)
+            if number is None:
+                return
+            # a short look at the first pieces is enough to find the picture and sound; the default waits for five seconds of them,
+            # which at the live edge means five seconds with nothing playing
+            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-analyzeduration", "1500000", "-probesize", "1500000",
+                   "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a:0?",
+                   "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+            threading.Thread(target=lambda: [print(f"[dvr] viewer ffmpeg: {ln.decode('utf-8', 'replace').rstrip()}", file=sys.stderr, flush=True)
+                                             for ln in proc.stderr], daemon=True).start()
+            pr = proc
+
+            def feed():
+                n = number
+                waited = 0.0
+                try:
+                    while not dvr.stopped:
+                        got = dvr.piece_after(n)
+                        if got is None:
+                            if not (dvr.proc and dvr.proc.poll() is None) and waited > 4:
+                                break                                      # the recording itself has ended
+                            time.sleep(0.2)
+                            waited += 0.2
+                            if waited > 45:
+                                break
+                            continue
+                        waited = 0.0
+                        n = got[0] + 1
+                        try:
+                            with open(dvr.dir / got[1], "rb") as f:
+                                pr.stdin.write(f.read())
+                                pr.stdin.flush()
+                        except FileNotFoundError:
+                            continue
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        pr.stdin.close()
+                    except OSError:
+                        pass
+            threading.Thread(target=feed, daemon=True).start()
+            print(f"[dvr] a viewer joined {back:.0f}s behind live", file=sys.stderr, flush=True)
+            fd = proc.stdout.fileno()
+            while True:
+                data = os.read(fd, 64 * 1024)
+                if not data:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                    break
+                total += len(data)
+                self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+                self.wfile.flush()
+        except (OSError, ValueError):                                     # the player closed the connection (a seek, stop, or leaving)
+            pass
+        finally:
+            dvr.viewers -= 1
+            dvr.idle_since = time.monotonic()
+            if proc:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            print(f"[dvr] a viewer left after {total // 1024} KB", file=sys.stderr, flush=True)
+
     def _serve(self, head: bool):
         entry = self.server.entries.get(self.path.split("?")[0].strip("/").split("/")[0])     # type: ignore[attr-defined]
         if not entry:
@@ -333,6 +582,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if entry[0] == "retime":
             self._serve_retimed(head, entry[1])
+            return
+        if entry[0] == "dvr":
+            self._serve_dvr(head, self.path.split("?")[0].strip("/").split("/")[0])
             return
         if entry[0] == "live":
             self._maybe_refresh_live(self.path.split("?")[0].strip("/").split("/")[0])
@@ -440,6 +692,7 @@ class StreamProxy:
             s = _Server(("127.0.0.1", 0), _Handler)
             s.daemon_threads = True
             s.entries = {}                                       # type: ignore[attr-defined]
+            s.dvrs = {}                                          # type: ignore[attr-defined]
             threading.Thread(target=s.serve_forever, daemon=True).start()
             self._server = s
         return self._server
@@ -485,6 +738,26 @@ class StreamProxy:
         s.entries[token] = ("retime", local_url)                  # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}/live.ts"
 
+    def dvr(self, local_url: str) -> str:
+        """`local_url` (one of this proxy's own addresses) recorded as it plays, so it can be paused, rewound and sent back to live.
+        Add ?back=SECONDS to start that far behind live. Falls back to plain pass-through when ffmpeg is missing or switched off."""
+        if not retime_enabled() or os.environ.get("MARQUEE_DVR") == "0":
+            return self.retimed(local_url)
+        s = self._start()
+        self._n += 1
+        token = f"d{self._n}"
+        s.entries[token] = ("dvr",)                                # type: ignore[attr-defined]
+        s.dvrs[token] = Dvr(local_url)                             # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}/live.ts"
+
+    def dvr_status(self, url: str) -> dict | None:
+        """The recording's state for an address made by dvr(), or None for anything else."""
+        if not self._server:
+            return None
+        m = re.search(r"/(d\d+)/live\.ts", url or "")
+        d = self._server.dvrs.get(m.group(1)) if m else None      # type: ignore[attr-defined]
+        return d.status() if d else None
+
     def add_hls(self, url: str, part: str, state) -> str:
         """The local address of the channel ("main") or the current commercial break ("ad") of a live playlist; `state` is a core.twitch.AdState."""
         s = self._start()
@@ -495,5 +768,7 @@ class StreamProxy:
 
     def stop(self) -> None:
         if self._server:
+            for d in list(getattr(self._server, "dvrs", {}).values()):
+                d.stop()
             self._server.shutdown()
             self._server = None

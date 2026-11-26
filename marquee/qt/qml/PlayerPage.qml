@@ -30,6 +30,12 @@ Kirigami.Page {
     property real liveLast: -1
     property int liveRetries: 0
     property double pausedAt: 0                     // when a live stream was paused, so resuming after a while can go back to the live edge
+    // A live YouTube stream is recorded while it plays (see core/streamproxy.py Dvr), so it can be paused, rewound and sent back to live.
+    property var dvr: ({})                          // {oldest, live, viewerStart, alive}: seconds from the start of the recording
+    property int dvrOpens: 0
+    readonly property bool dvrOn: !!info.isLive && !!info.dvr && !!dvr.alive
+    // how far behind the live edge the picture is, in seconds
+    readonly property real behind: dvrOn ? Math.max(0, dvr.live - (dvr.viewerStart + videoPlayer.position / 1000)) : 0
     property int defaultAudio: 0                    // the audio track the file starts on (what clicking the chosen track again goes back to)
     property string retriedId: ""                  // a YouTube video already re-opened once after failing (so a real failure still shows)
     property string errorText: ""
@@ -230,8 +236,19 @@ Kirigami.Page {
         return false
     }
     // a live YouTube stream only keeps about half a minute behind the live edge, so anything older has gone: load it again
-    function goLive() {
+    // join the recording `back` seconds behind live (0 = the live edge) without asking YouTube for anything new
+    function attach(back) {
+        pausedAt = 0; liveStill = 0; liveLast = -1
+        videoPlayer.source = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
+        videoPlayer.play()
+    }
+    function nudge(seconds) {                          // seconds > 0 goes forward
+        if (dvrOn) attach(Math.max(0, behind - seconds))
+        else player.position = Math.max(0, Math.min(player.duration, player.position + seconds * 1000))
+    }
+    function goLive(full) {
         if (!info.isLive) return
+        if (!full && dvrOn) { attach(0); return }
         pausedAt = 0; liveStill = 0; liveLast = -1
         // ask YouTube for a fresh address every time: reloading the old one can be refused (HTTP 403) and then nothing plays
         youtube.reopen(info.id.substring(3), 0, youtube.quality)
@@ -441,7 +458,7 @@ Kirigami.Page {
             else if (playbackState === MediaPlayer.PlayingState && pp.pausedAt > 0) {
                 var longPause = Date.now() - pp.pausedAt > 15000
                 pp.pausedAt = 0
-                if (longPause) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(pp.goLive) }
+                if (longPause && !pp.dvrOn) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(function () { pp.goLive(true) }) }
             }
         }
         onMediaStatusChanged: {
@@ -503,14 +520,22 @@ Kirigami.Page {
             if (pp.liveStill >= 3 && pp.liveRetries < 3) {
                 pp.liveRetries++
                 console.log("marquee: youtube: the live stream stopped at " + Math.round(p / 1000) + "s; starting it again (" + pp.liveRetries + ")")
-                pp.goLive()
+                pp.goLive(pp.liveRetries > 1)
             }
         }
     }
+    // while a live YouTube stream plays, ask how much of it has been recorded
+    Timer {
+        interval: 1000
+        repeat: true
+        triggeredOnStart: true
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !!pp.info.dvr
+        onTriggered: pp.dvr = youtube.dvrStatus(pp.info.id.substring(3))
+    }
     Shortcut { sequences: ["Up", "PgUp"]; enabled: pp.isLive; onActivated: pp.step(1) }
     Shortcut { sequences: ["Down", "PgDown"]; enabled: pp.isLive; onActivated: pp.step(-1) }
-    Shortcut { sequences: ["Right"]; enabled: !pp.isLive; onActivated: player.position = Math.min(player.duration, player.position + 10000) }
-    Shortcut { sequences: ["Left"]; enabled: !pp.isLive; onActivated: player.position = Math.max(0, player.position - 10000) }
+    Shortcut { sequences: ["Right"]; enabled: !pp.isLive; onActivated: pp.nudge(10) }
+    Shortcut { sequences: ["Left"]; enabled: !pp.isLive; onActivated: pp.nudge(-10) }
     Shortcut { sequences: ["C"]; onActivated: pp.toggleSubtitles() }
     Shortcut { sequences: ["M"]; onActivated: pp.toggleMute() }
     Shortcut { sequences: ["L"]; enabled: !pp.isVideo; onActivated: pp.toggleLyrics() }
@@ -803,9 +828,26 @@ Kirigami.Page {
         HoverHandler { id: footerHover; onPointChanged: pp.moved(point.scenePosition) }
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.smallSpacing
+            // a recorded live stream: drag back to an earlier moment, or press Live to return to the edge
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
-                visible: !pp.isLive
+                visible: pp.dvrOn && pp.dvr.live - pp.dvr.oldest > 6
+                QQC2.Label { text: pp.behind > 4 ? "-" + pp.fmt(pp.behind) : "Live" }
+                QQC2.Slider {
+                    id: dvrSeek
+                    Layout.fillWidth: true
+                    from: pp.dvr.oldest || 0
+                    to: Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
+                    onPressedChanged: if (!pressed) pp.attach(Math.max(0, pp.dvr.live - value))
+                    Binding { target: dvrSeek; property: "value"; value: Math.min(dvrSeek.to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000); when: !dvrSeek.pressed }
+                    QQC2.ToolTip.text: "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
+                    QQC2.ToolTip.visible: pressed
+                }
+                QQC2.Label { text: pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
+            }
+            RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+                visible: !pp.isLive && !pp.dvrOn
                 QQC2.Label { text: pp.fmt(player.position) }
                 QQC2.Slider {
                     id: seek
@@ -960,9 +1002,9 @@ Kirigami.Page {
                 QQC2.ToolButton {
                     visible: pp.isVideo && !!info.yt && !!info.isLive
                     text: "● Live"
-                    highlighted: videoPlayer.playbackState !== MediaPlayer.PlayingState
-                    onClicked: pp.goLive()
-                    QQC2.ToolTip.text: "Jump back to the live broadcast"
+                    highlighted: pp.dvrOn ? pp.behind > 4 : videoPlayer.playbackState !== MediaPlayer.PlayingState
+                    onClicked: pp.goLive(false)
+                    QQC2.ToolTip.text: pp.dvrOn ? "Jump to the live edge of the broadcast" : "Jump back to the live broadcast"
                     QQC2.ToolTip.visible: hovered
                 }
                 QQC2.ToolButton {
