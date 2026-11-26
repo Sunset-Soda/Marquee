@@ -695,7 +695,14 @@ class StreamProxy:
             s.dvrs = {}                                          # type: ignore[attr-defined]
             threading.Thread(target=s.serve_forever, daemon=True).start()
             self._server = s
+            import atexit
+            atexit.register(self._stop_recordings)               # closing Marquee must not leave a recorder running
         return self._server
+
+    def _stop_recordings(self) -> None:
+        if self._server:
+            for d in list(getattr(self._server, "dvrs", {}).values()):
+                d.stop()
 
     def add(self, url: str, headers: dict | None = None) -> str:
         """The local address that plays `url`."""
