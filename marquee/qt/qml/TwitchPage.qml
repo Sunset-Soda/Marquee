@@ -69,6 +69,10 @@ Kirigami.Page {
         interval: 1000; repeat: true; running: pg.phase === "playing"
         onTriggered: if (!pg.scrubbing) pg.dvr = twitch.dvrStatus()
     }
+    function fmtLen(s) {
+        s = Math.max(0, Math.round(s))
+        return Math.floor(s / 60) + ":" + (s % 60 < 10 ? "0" : "") + (s % 60)
+    }
     function fmtBehind(s) {
         s = Math.round(s)
         return "-" + Math.floor(s / 60) + ":" + (s % 60 < 10 ? "0" : "") + (s % 60)
@@ -91,7 +95,7 @@ Kirigami.Page {
 
     MediaPlayer {
         id: player
-        audioOutput: AudioOutput { muted: pg.muted }
+        audioOutput: AudioOutput { muted: pg.muted; volume: volSlider.value }
         videoOutput: video
         onErrorOccurred: (error, message) => {
             console.log("marquee: twitch: player error: " + message)
@@ -261,13 +265,6 @@ Kirigami.Page {
                     QQC2.Label { text: twitch.channel; color: "white"; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
                     QQC2.Label { text: twitch.stream.title || ""; color: "white"; opacity: 0.8; elide: Text.ElideRight; Layout.fillWidth: true; font: Kirigami.Theme.smallFont }
                 }
-                QQC2.ToolButton {
-                    visible: pg.phase === "playing"
-                    text: "● Live"
-                    highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
-                    onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
-                    QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
-                }
                 QQC2.Label { text: twitch.stream.height ? twitch.stream.height + "p" : ""; color: "white"; opacity: 0.8 }
                 QQC2.ComboBox {
                     id: qBox
@@ -283,55 +280,70 @@ Kirigami.Page {
                         pg.watch(twitch.channel)
                     }
                 }
-                QQC2.ToolButton {
-                    icon.name: pg.muted ? "audio-volume-muted" : "audio-volume-high"
-                    onClicked: pg.muted = !pg.muted
-                    QQC2.ToolTip.text: pg.muted ? "Unmute" : "Mute"; QQC2.ToolTip.visible: hovered
-                }
             }
         }
-        // rewind bar: the left end is the oldest moment kept, the right end is live
-        Rectangle {
+        // the play bar: pause, drag back through what has been kept, Live, volume
+        QQC2.ToolBar {
             id: rewind
+            z: 20
             anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
-            height: rewRow.implicitHeight + Kirigami.Units.largeSpacing * 2
-            visible: pg.phase === "playing" && pg.dvr.alive
-            gradient: Gradient {
-                GradientStop { position: 0; color: "transparent" }
-                GradientStop { position: 1; color: "#cc000000" }
-            }
-            RowLayout {
-                id: rewRow
-                anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: Kirigami.Units.largeSpacing }
-                QQC2.ToolButton {
-                    icon.name: player.playbackState === MediaPlayer.PlayingState ? "media-playback-pause" : "media-playback-start"
-                    onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
-                }
-                QQC2.Slider {
-                    id: rewSlider
-                    Layout.fillWidth: true
-                    from: 0
-                    to: Math.max(1, pg.dvr.live - pg.dvr.oldest)
-                    onPressedChanged: {
-                        if (pressed) pg.scrubbing = true
-                        else if (pg.scrubbing) {
-                            pg.scrubbing = false
-                            var back = to - value
-                            pg.openMain(back < 8 ? 0 : back)
+            visible: pg.phase === "playing"
+            contentItem: ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+                RowLayout {
+                    spacing: Kirigami.Units.largeSpacing
+                    visible: pg.dvr.alive && pg.dvr.live - pg.dvr.oldest > 6
+                    QQC2.Label { text: pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : "Live") }
+                    QQC2.Slider {
+                        id: rewSlider
+                        Layout.fillWidth: true
+                        from: 0
+                        to: Math.max(1, pg.dvr.live - pg.dvr.oldest)
+                        onPressedChanged: {
+                            if (pressed) pg.scrubbing = true
+                            else if (pg.scrubbing) {
+                                pg.scrubbing = false
+                                var back = to - value
+                                pg.openMain(back < 8 ? 0 : back)
+                            }
                         }
+                        Binding { target: rewSlider; property: "value"; value: Math.max(0, rewSlider.to - pg.behind); when: !pg.scrubbing }
+                        QQC2.ToolTip.text: pg.fmtBehind(rewSlider.to - rewSlider.value)
+                        QQC2.ToolTip.visible: pressed
                     }
+                    QQC2.Label { text: pg.fmtLen(pg.dvr.live - pg.dvr.oldest) + " recorded" }
                 }
-                Binding { target: rewSlider; property: "value"; value: Math.max(0, rewSlider.to - pg.behind); when: !pg.scrubbing }
-                QQC2.Label {
-                    color: "white"
-                    Layout.minimumWidth: Kirigami.Units.gridUnit * 3
-                    horizontalAlignment: Text.AlignRight
-                    text: pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : "Live")
+                RowLayout {
+                    spacing: Kirigami.Units.smallSpacing
+                    QQC2.ToolButton {
+                        icon.name: player.playbackState === MediaPlayer.PlayingState ? "media-playback-pause" : "media-playback-start"
+                        display: QQC2.AbstractButton.IconOnly
+                        text: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
+                        onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
+                    }
+                    QQC2.ToolButton {
+                        text: "● Live"
+                        highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
+                        onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
+                        QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
+                    }
+                    Item { Layout.fillWidth: true }
+                    QQC2.ToolButton {
+                        icon.name: pg.muted || volSlider.value === 0 ? "player-volume-muted" : "player-volume"
+                        display: QQC2.AbstractButton.IconOnly
+                        text: pg.muted ? "Unmute" : "Mute"
+                        onClicked: pg.muted = !pg.muted
+                    }
+                    QQC2.Slider {
+                        id: volSlider
+                        from: 0; to: 1; value: 1
+                        implicitWidth: Kirigami.Units.gridUnit * 6
+                    }
                 }
             }
         }
         QQC2.Label {
-            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: pg.dvr.alive ? rewind.height : Kirigami.Units.largeSpacing; leftMargin: Kirigami.Units.largeSpacing; rightMargin: Kirigami.Units.largeSpacing }
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: rewind.height + Kirigami.Units.smallSpacing; leftMargin: Kirigami.Units.largeSpacing; rightMargin: Kirigami.Units.largeSpacing }
             visible: pg.phase === "playing" && !!(twitch.stream.note || twitch.stream.adfree)
             color: "white"
             opacity: 0.85
