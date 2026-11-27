@@ -464,7 +464,10 @@ class Recorder:
                 if self._fails >= 10:
                     self.ended = True
             time.sleep(self._poll)
-        self.stop()
+        if not self.ended:
+            self.stop()                     # nobody is watching any more
+        # When the channel went offline the pieces stay on disk, so what was recorded can still be played (and scrubbed);
+        # whoever opened the recording removes it with stop() when they are done.
 
     def step(self) -> int:
         """One look at the channel's playlist; saves what is new. Returns how many pieces were added."""

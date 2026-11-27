@@ -52,12 +52,18 @@ Kirigami.Page {
     readonly property bool mediaIsPlaying: player.playbackState === MediaPlayer.PlayingState
     readonly property string mediaTitle: twitch.channel
     readonly property string mediaSub: (twitch.stream && twitch.stream.title) || "Twitch"
-    function mediaToggle() { if (player.playbackState === MediaPlayer.PlayingState) player.pause(); else player.play() }
+    function mediaToggle() { togglePlay() }
     function mediaPause() { player.pause() }
-    function jumpLive() { vodMode = false; if (dvr.alive) openMain(0); else watch(twitch.channel) }
+    function jumpLive() { if (offline) return; vodMode = false; if (dvr.alive) openMain(0); else watch(twitch.channel) }
 
     // ---- pause / rewind / Live (the channel is kept on disk while you watch) ----
     property var dvr: ({ alive: false })
+    readonly property bool offline: !!dvr.alive && !!dvr.ended                  // the channel has gone offline; what was recorded can still be played
+    readonly property bool atEnd: offline && player.mediaStatus === MediaPlayer.EndOfMedia
+    function togglePlay() {
+        if (atEnd) { openMain(sliderTo); return }                              // played to the end: start again from the beginning of the recording
+        if (player.playbackState === MediaPlayer.PlayingState) player.pause(); else player.play()
+    }
     property real partStart: 0                      // stream time at which the playlist now playing began (the channel's floor, or the break's start)
     property bool scrubbing: false
     readonly property real behind: dvr.alive ? Math.max(0, dvr.live - (partStart + player.position / 1000)) : 0
@@ -93,7 +99,11 @@ Kirigami.Page {
     }
     Timer {
         interval: 1000; repeat: true; running: pg.phase === "playing"
-        onTriggered: if (!pg.scrubbing) pg.dvr = twitch.dvrStatus()
+        onTriggered: if (!pg.scrubbing) {
+            var was = pg.offline
+            pg.dvr = twitch.dvrStatus()
+            if (!was && pg.offline) applicationWindow().showPassiveNotification("This channel went offline. You can still replay what was recorded.")
+        }
     }
     function fmtLen(s) {
         s = Math.max(0, Math.round(s))
@@ -167,6 +177,14 @@ Kirigami.Page {
                 }
                 player.play()
                 return
+            }
+            if (mediaStatus === MediaPlayer.EndOfMedia && pg.phase === "playing" && !pg.vodMode) {
+                pg.dvr = twitch.dvrStatus()
+                if (pg.dvr.alive && pg.dvr.ended) {
+                    // the channel went offline: what was recorded is still here to replay and scrub through
+                    console.log("marquee: twitch: the channel is offline; the recording stays so it can be replayed")
+                    return
+                }
             }
             if ((mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia) && pg.phase === "playing")
                 pg.reconnect("the stream ended")
@@ -327,7 +345,7 @@ Kirigami.Page {
                     visible: pg.vodMode || (pg.dvr.alive && pg.dvr.live - pg.dvr.oldest > 6)
                     QQC2.Label {
                         text: pg.vodMode ? pg.fmtLen(pg.scrubbing ? rewSlider.value : pg.sliderAt)
-                                         : (pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : "Live"))
+                                         : (pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : (pg.offline ? "End" : "Live")))
                     }
                     QQC2.Slider {
                         id: rewSlider
@@ -355,7 +373,7 @@ Kirigami.Page {
                         QQC2.ToolTip.text: pg.vodMode ? pg.fmtLen(rewSlider.value) : pg.fmtBehind(rewSlider.to - rewSlider.value)
                         QQC2.ToolTip.visible: pressed
                     }
-                    QQC2.Label { text: pg.vodMode ? pg.fmtLen(pg.vodTotal) + " saved" : pg.fmtLen(pg.dvr.live - pg.dvr.oldest) + " recorded" }
+                    QQC2.Label { text: pg.vodMode ? pg.fmtLen(pg.vodTotal) + " saved" : pg.fmtLen(pg.dvr.live - pg.dvr.oldest) + (pg.offline ? " recorded · offline" : " recorded") }
                     QQC2.ToolButton {
                         visible: !pg.vodMode && twitch.vodAvailable
                         enabled: !pg.startingVod
@@ -371,14 +389,15 @@ Kirigami.Page {
                         icon.name: player.playbackState === MediaPlayer.PlayingState ? "media-playback-pause" : "media-playback-start"
                         display: QQC2.AbstractButton.IconOnly
                         text: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
-                        onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
+                        onClicked: pg.togglePlay()
                     }
                     Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
-                        text: "● Live"
-                        highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.awayFromLive
+                        text: pg.offline ? "Offline" : "● Live"
+                        enabled: !pg.offline
+                        highlighted: !pg.offline && (player.playbackState !== MediaPlayer.PlayingState || pg.awayFromLive)
                         onClicked: pg.jumpLive()
-                        QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
+                        QQC2.ToolTip.text: pg.offline ? "This channel has gone offline" : "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
                     }
                     QQC2.ComboBox {
                         id: qBox

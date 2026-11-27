@@ -2963,6 +2963,26 @@ class TwitchRecorderTests(unittest.TestCase):
                               get=lambda u: u.encode(), folder=folder)
         return rec, folder
 
+
+    def test_a_channel_going_offline_keeps_what_was_recorded(self):
+        rec, folder = self.make()
+        for self.n in range(4, 20):
+            rec.step()
+        def gone(u):
+            raise OSError("offline")
+        rec._fetch = gone
+        rec._poll = 0.0
+        rec._thread = __import__("threading").Thread(target=rec._run, daemon=True)
+        rec.start()
+        rec._thread.join(10)
+        self.assertTrue(rec.ended)
+        self.assertFalse(rec.stopped)
+        self.assertTrue(os.path.isfile(os.path.join(folder, "000005.ts")))       # the pieces are still there
+        self.assertIn("#EXT-X-ENDLIST", rec.text())                               # so it plays through and stops like a recording
+        self.assertTrue(rec.status()["alive"])
+        rec.stop()
+        self.assertFalse(os.path.isdir(folder))                                   # and goes when the page is closed
+
     def test_keeps_everything_that_scrolled_out(self):
         rec, folder = self.make()
         for self.n in range(4, 40):
