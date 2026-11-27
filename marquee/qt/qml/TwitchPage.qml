@@ -45,6 +45,15 @@ Kirigami.Page {
     Component.onCompleted: { if (twitch.signedIn) twitch.refresh(); showSettings = !twitch.signedIn && twitch.clientId === "" }
     Component.onDestruction: { player.stop(); if (twitch) twitch.stopRecording() }
 
+    // what the media keys and the desktop's media widget see (Main.qml)
+    readonly property bool mediaPlaying: phase === "playing"
+    readonly property bool mediaIsPlaying: player.playbackState === MediaPlayer.PlayingState
+    readonly property string mediaTitle: twitch.channel
+    readonly property string mediaSub: (twitch.stream && twitch.stream.title) || "Twitch"
+    function mediaToggle() { if (player.playbackState === MediaPlayer.PlayingState) player.pause(); else player.play() }
+    function mediaPause() { player.pause() }
+    function jumpLive() { if (dvr.alive) openMain(0); else watch(twitch.channel) }
+
     // ---- pause / rewind / Live (the channel is kept on disk while you watch) ----
     property var dvr: ({ alive: false })
     property real partStart: 0                      // stream time at which the playlist now playing began (the channel's floor, or the break's start)
@@ -266,20 +275,6 @@ Kirigami.Page {
                     QQC2.Label { text: twitch.stream.title || ""; color: "white"; opacity: 0.8; elide: Text.ElideRight; Layout.fillWidth: true; font: Kirigami.Theme.smallFont }
                 }
                 QQC2.Label { text: twitch.stream.height ? twitch.stream.height + "p" : ""; color: "white"; opacity: 0.8 }
-                QQC2.ComboBox {
-                    id: qBox
-                    visible: pg.phase === "playing"
-                    model: ["Best"].concat((twitch.stream.heights || []).map(function (h) { return h + "p" }))
-                    currentIndex: {
-                        var hs = twitch.stream.heights || []
-                        var i = hs.indexOf(parseInt(twitch.quality))
-                        return twitch.quality === "best" || i < 0 ? 0 : i + 1
-                    }
-                    onActivated: (i) => {
-                        twitch.setQuality(i === 0 ? "best" : String((twitch.stream.heights || [])[i - 1]))
-                        pg.watch(twitch.channel)
-                    }
-                }
             }
         }
         // the play bar: pause, drag back through what has been kept, Live, volume
@@ -327,6 +322,20 @@ Kirigami.Page {
                         highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
                         onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
                         QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
+                    }
+                    QQC2.ComboBox {
+                        id: qBox
+                        visible: pg.phase === "playing"
+                        model: ["Best"].concat((twitch.stream.heights || []).map(function (h) { return h + "p" }))
+                        currentIndex: {
+                            var hs = twitch.stream.heights || []
+                            var i = hs.indexOf(parseInt(twitch.quality))
+                            return twitch.quality === "best" || i < 0 ? 0 : i + 1
+                        }
+                        onActivated: (i) => {
+                            twitch.setQuality(i === 0 ? "best" : String((twitch.stream.heights || [])[i - 1]))
+                            pg.watch(twitch.channel)
+                        }
                     }
                     QQC2.ToolButton {
                         icon.name: pg.muted || volSlider.value === 0 ? "player-volume-muted" : "player-volume"

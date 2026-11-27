@@ -49,11 +49,16 @@ Kirigami.ApplicationWindow {
     // Media keys and the desktop's media widget (MPRIS, see mpris.py). Whatever is on screen answers the keys:
     // a video or channel page if one is open, otherwise the music player.
     readonly property var mediaPage: (pageStack.depth > 1 && pageStack.lastItem && pageStack.lastItem.toggle) ? pageStack.lastItem : null
+    // the Twitch page is the window's page (not one pushed on top), so it is looked up on its own
+    readonly property var twitchPlaying: (twitchActive && pageStack.depth <= 1 && pageStack.lastItem && pageStack.lastItem.mediaPlaying) ? pageStack.lastItem : null
     Timer {
         interval: 700; repeat: true; running: true
         onTriggered: {
             var pg = root.mediaPage
-            if (pg && pg.player)
+            var tp = root.twitchPlaying
+            if (tp)
+                marquee.setMediaState(tp.mediaTitle, tp.mediaSub, "", tp.mediaIsPlaying, true)
+            else if (pg && pg.player)
                 marquee.setMediaState(pg.info.title || "", pg.info.sub || "", pg.info.cover || "",
                                       pg.player.playbackState === MediaPlayer.PlayingState, true)
             else if (podEngine.active && !musicEngine.active)
@@ -68,7 +73,12 @@ Kirigami.ApplicationWindow {
         function onMediaCommand(cmd) {
             var pg = root.mediaPage
             var live = pg ? pg.isLive : false
-            if (pg) {
+            var tp = root.twitchPlaying
+            if (tp) {
+                if (cmd === "playpause" || (cmd === "play" && !tp.mediaIsPlaying) || (cmd === "pause" && tp.mediaIsPlaying)) tp.mediaToggle()
+                else if (cmd === "next") tp.jumpLive()
+                else if (cmd === "stop") tp.mediaPause()
+            } else if (pg) {
                 var p = pg.player, playing = p.playbackState === MediaPlayer.PlayingState
                 if (cmd === "playpause" || (cmd === "play" && !playing) || (cmd === "pause" && playing)) pg.toggle()
                 else if (cmd === "next") pg.step(1)
