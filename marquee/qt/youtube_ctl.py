@@ -19,7 +19,8 @@ class YoutubeController(QObject):
     _progress = Signal(str)
     imported = Signal(int, int)         # channels added, channels already subscribed
     ready = Signal(str)                 # a video's stream address is known: play "yt:<id>"
-    dvrRestarted = Signal(str, str, str)    # a live stream's recording now starts from the beginning: video id, the new address ("" if that failed), a note for the person
+    historyReady = Signal(str, str, float, float)   # video id, an address playing the earlier part from `offset`, how many seconds that stretch covers
+    historyFailed = Signal(str, str)
     shortReady = Signal(str)            # the same for a Short, which plays inside the Shorts page instead
     shortFailed = Signal(str, str)      # a Short's id and why it could not be opened
     _done = Signal(str, object)
@@ -760,49 +761,32 @@ class YoutubeController(QObject):
         info = self._c.yt_info.get(f"yt:{video_id}") or {}
         return self._proxy.dvr_status(info.get("url", "")) or {}
 
-    @Slot(str)
-    def startFromBeginning(self, video_id: str):
-        """Record a live stream from the first piece YouTube still keeps (up to MARQUEE_DVR_START_MINUTES, default 180) instead of
-        from now, so the rewind bar reaches back to where the broadcast began. The recording is replaced; the page reopens it."""
-        import os
+    @Slot(str, float)
+    def historyOpen(self, video_id: str, offset: float):
+        """Play a live stream from `offset` seconds after the first piece YouTube still lists (0 = the very beginning of what it keeps).
+        Answers with historyReady (the address, where it starts, how long the stretch is) or historyFailed. Nothing is recorded: the pieces
+        are fetched from YouTube as they play, so any point in the stretch can be opened at once."""
         import sys
         import threading
-        key = f"yt:{video_id}"
+        import urllib.request
 
         def work():
-            new, note = "", ""
             try:
-                try:
-                    secs = float(os.environ.get("MARQUEE_DVR_START_MINUTES") or 180) * 60
-                except ValueError:
-                    secs = 180 * 60
-                url, headers = self._live_address(video_id)
-                local = self._proxy.add_live(url, headers, refresh=lambda: self._live_address(video_id), history=secs)
-                made = self._proxy.dvr(local, history=secs)
-                if self._proxy.dvr_status(made) is None:
-                    raise RuntimeError("recording is not available")
-                info = self._c.yt_info.get(key)
-                if info is not None:
-                    old = info.get("url", "")
-                    info["url"] = made
-                    self._proxy.stop_dvr(old)
-                new = made
-                try:                                             # how far back the playlist we are recording from really reaches
-                    import urllib.request
-                    with urllib.request.urlopen(local, timeout=30) as r:
-                        rows = r.read().decode("utf-8", "replace").splitlines()
-                    span = sum(float(l[8:].split(",")[0]) for l in rows if l.startswith("#EXTINF:"))
-                    n = sum(1 for l in rows if l.startswith("#EXTINF:"))
-                    mins = round(span / 60)
-                    note = (f"Going back {mins} minutes, the most Marquee keeps (MARQUEE_DVR_START_MINUTES raises it)." if span >= secs - 60
-                            else f"Going back {mins} minutes, as far as YouTube keeps this stream.")
-                    print(f"[dvr] {video_id}: the playlist reaches back {span / 60:.0f} minutes ({n} pieces of about {span / max(1, n):.1f}s); cap is {secs / 60:.0f} minutes",
-                          file=sys.stderr, flush=True)
-                except Exception as e:
-                    print(f"[dvr] could not measure how far back the stream goes: {e}", file=sys.stderr, flush=True)
+                hist = self.__dict__.setdefault("_hist", {})
+                local = hist.get(video_id)
+                if not local:
+                    url, headers = self._live_address(video_id)
+                    local = hist[video_id] = self._proxy.add_live(url, headers, refresh=lambda: self._live_address(video_id))
+                with urllib.request.urlopen(f"{local}?from={max(0.0, offset):.1f}", timeout=30) as r:
+                    total = float(r.headers.get("X-Total-Seconds") or 0)
+                if total <= 0:
+                    raise RuntimeError("YouTube listed no earlier part of this stream")
+                url = self._proxy.retimed(f"{local}?from={max(0.0, offset):.1f}")
+                print(f"[history] {video_id}: opening {offset:.0f}s into the {total / 60:.0f} minutes YouTube keeps of this stream", file=sys.stderr, flush=True)
+                self.historyReady.emit(video_id, url, max(0.0, min(offset, total)), total)
             except Exception as e:
-                print(f"[dvr] could not start from the beginning: {e}", file=sys.stderr, flush=True)
-            self.dvrRestarted.emit(video_id, new, note)
+                print(f"[history] could not open the earlier part of {video_id}: {e}", file=sys.stderr, flush=True)
+                self.historyFailed.emit(video_id, "Could not open the earlier part of this broadcast.")
         threading.Thread(target=work, daemon=True).start()
 
     def _live_address(self, video_id: str):

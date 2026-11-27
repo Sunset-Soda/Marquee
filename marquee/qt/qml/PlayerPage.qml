@@ -33,8 +33,11 @@ Kirigami.Page {
     // A live YouTube stream is recorded while it plays (see core/streamproxy.py Dvr), so it can be paused, rewound and sent back to live.
     property var dvr: ({})                          // {oldest, live, viewerStart, alive}: seconds from the start of the recording
     property int dvrOpens: 0
-    property string dvrUrl: ""                      // the recording that replaced the first one when "From the start" was pressed
-    property string dvrFor: ""
+    // "From the start": the live stream played from an earlier point in what YouTube still lists, nothing recorded
+    property bool histMode: false
+    property real histOffset: 0                     // seconds into that stretch where the picture now playing began
+    property real histTotal: 0                      // how long that stretch is
+    readonly property real histAt: Math.min(histTotal, histOffset + videoPlayer.position / 1000)
     property bool startingOver: false
     property bool dvrScrub: false                   // the rewind bar's handle is held
     readonly property bool dvrOn: !!info.isLive && !!info.dvr && !!dvr.alive
@@ -243,15 +246,17 @@ Kirigami.Page {
     // join the recording `back` seconds behind live (0 = the live edge) without asking YouTube for anything new
     function attach(back) {
         pausedAt = 0; liveStill = 0; liveLast = -1
-        videoPlayer.source = (dvrFor === info.id && dvrUrl ? dvrUrl : info.url) + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
+        videoPlayer.source = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
         videoPlayer.play()
     }
     function nudge(seconds) {                          // seconds > 0 goes forward
-        if (dvrOn) attach(Math.max(0, behind - seconds))
+        if (histMode) youtube.historyOpen(info.id.substring(3), Math.max(0, Math.min(histTotal, histAt + seconds)))
+        else if (dvrOn) attach(Math.max(0, behind - seconds))
         else player.position = Math.max(0, Math.min(player.duration, player.position + seconds * 1000))
     }
     function goLive(full) {
         if (!info.isLive) return
+        if (histMode) { histMode = false; startingOver = false; full = true; dvr = ({}) }       // leave the earlier part: a fresh start at the live edge
         if (!full && dvrOn) { attach(0); return }
         pausedAt = 0; liveStill = 0; liveLast = -1
         // ask YouTube for a fresh address every time: reloading the old one can be refused (HTTP 403) and then nothing plays
@@ -462,7 +467,7 @@ Kirigami.Page {
             else if (playbackState === MediaPlayer.PlayingState && pp.pausedAt > 0) {
                 var longPause = Date.now() - pp.pausedAt > 15000
                 pp.pausedAt = 0
-                if (longPause && !pp.dvrOn) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(function () { pp.goLive(true) }) }
+                if (longPause && !pp.dvrOn && !pp.histMode) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(function () { pp.goLive(true) }) }
             }
         }
         onMediaStatusChanged: {
@@ -515,7 +520,7 @@ Kirigami.Page {
     Timer {
         interval: 3000
         repeat: true
-        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && videoPlayer.playbackState === MediaPlayer.PlayingState
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !pp.histMode && videoPlayer.playbackState === MediaPlayer.PlayingState
         onTriggered: {
             var p = videoPlayer.position
             if (p === pp.liveLast) pp.liveStill++
@@ -533,7 +538,7 @@ Kirigami.Page {
         interval: 1000
         repeat: true
         triggeredOnStart: true
-        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !!pp.info.dvr
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !!pp.info.dvr && !pp.histMode
         onTriggered: pp.dvr = youtube.dvrStatus(pp.info.id.substring(3))
     }
     Shortcut { sequences: ["Up", "PgUp"]; enabled: pp.isLive; onActivated: pp.step(1) }
@@ -835,15 +840,16 @@ Kirigami.Page {
             // a recorded live stream: drag back to an earlier moment, or press Live to return to the edge
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
-                visible: pp.dvrOn && pp.dvr.live - pp.dvr.oldest > 6
-                QQC2.Label { text: pp.behind > 4 ? "-" + pp.fmt(pp.behind) : "Live" }
+                visible: pp.histMode || (pp.dvrOn && pp.dvr.live - pp.dvr.oldest > 6)
+                QQC2.Label { text: pp.histMode ? pp.fmt(pp.histAt) : (pp.behind > 4 ? "-" + pp.fmt(pp.behind) : "Live") }
                 QQC2.Slider {
                     id: dvrSeek
                     Layout.fillWidth: true
-                    from: pp.dvr.oldest || 0
-                    to: Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
+                    from: pp.histMode ? 0 : (pp.dvr.oldest || 0)
+                    to: pp.histMode ? Math.max(1, pp.histTotal) : Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
                     // the handle follows the picture except while held; only a handle that was really moved rewinds
-                    function follow() { if (!pressed && !pp.dvrScrub) value = Math.min(to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000) }
+                    function at() { return pp.histMode ? pp.histAt : Math.min(to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000) }
+                    function follow() { if (!pressed && !pp.dvrScrub) value = at() }
                     Component.onCompleted: follow()
                     onToChanged: follow()
                     onFromChanged: follow()
@@ -851,22 +857,24 @@ Kirigami.Page {
                     onPressedChanged: {
                         if (pressed) pp.dvrScrub = true
                         else if (pp.dvrScrub) {
-                            var back = pp.dvr.live - value
-                            var now = pp.behind
+                            var now = at()
                             pp.dvrScrub = false
-                            if (Math.abs(back - now) > 3) pp.attach(Math.max(0, back)); else follow()
+                            if (Math.abs(value - now) > 3) {
+                                if (pp.histMode) youtube.historyOpen(pp.info.id.substring(3), value)
+                                else pp.attach(Math.max(0, pp.dvr.live - value))
+                            } else follow()
                         }
                     }
-                    QQC2.ToolTip.text: "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
+                    QQC2.ToolTip.text: pp.histMode ? pp.fmt(value) : "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
                     QQC2.ToolTip.visible: pressed
                 }
-                QQC2.Label { text: pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
+                QQC2.Label { text: pp.histMode ? pp.fmt(pp.histTotal) : pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
                 QQC2.ToolButton {
                     text: pp.startingOver ? "Fetching…" : "⏮ From the start"
                     enabled: !pp.startingOver
-                    visible: pp.dvrFor !== pp.info.id || pp.startingOver       // gone once the recording already starts at the beginning
-                    onClicked: { pp.startingOver = true; youtube.startFromBeginning(pp.info.id.substring(3)) }
-                    QQC2.ToolTip.text: "Go back to where the broadcast began (as far as YouTube keeps it, up to three hours)"
+                    visible: !pp.histMode
+                    onClicked: { pp.startingOver = true; youtube.historyOpen(pp.info.id.substring(3), 0) }
+                    QQC2.ToolTip.text: "Go back to where the broadcast began, as far as YouTube keeps it"
                     QQC2.ToolTip.visible: hovered
                 }
             }
@@ -1027,7 +1035,7 @@ Kirigami.Page {
                 QQC2.ToolButton {
                     visible: pp.isVideo && !!info.yt && !!info.isLive
                     text: "● Live"
-                    highlighted: pp.dvrOn ? pp.behind > 4 : videoPlayer.playbackState !== MediaPlayer.PlayingState
+                    highlighted: pp.histMode || (pp.dvrOn ? pp.behind > 4 : videoPlayer.playbackState !== MediaPlayer.PlayingState)
                     onClicked: pp.goLive(false)
                     QQC2.ToolTip.text: pp.dvrOn ? "Jump to the live edge of the broadcast" : "Jump back to the live broadcast"
                     QQC2.ToolTip.visible: hovered
@@ -1147,16 +1155,24 @@ Kirigami.Page {
     }
     Connections {
         target: youtube
-        function onDvrRestarted(vid, url, note) {
+        function onHistoryReady(vid, url, offset, total) {
+            if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
+            var first = !pp.histMode
+            pp.startingOver = false
+            pp.liveStill = 0; pp.liveLast = -1; pp.pausedAt = 0
+            pp.histMode = true
+            pp.histOffset = offset
+            pp.histTotal = total
+            pp.dvr = ({})
+            videoPlayer.stop()
+            videoPlayer.source = url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + (++pp.dvrOpens)
+            videoPlayer.play()
+            if (first) applicationWindow().showPassiveNotification("Going back " + Math.round(total / 60) + " minutes, as far as YouTube keeps this stream. Press Live to return.")
+        }
+        function onHistoryFailed(vid, message) {
             if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
             pp.startingOver = false
-            if (url) {
-                pp.dvrUrl = url
-                pp.dvrFor = pp.info.id
-                pp.dvr = ({})
-                pp.attach(100000000)                         // as far back as there is: the first piece
-                if (note) applicationWindow().showPassiveNotification(note)
-            } else applicationWindow().showPassiveNotification("Could not go back to the start of this broadcast.")
+            applicationWindow().showPassiveNotification(message)
         }
     }
     // YouTube started at 360p so it opened quickly; the bigger picture downloads behind it and replaces it when ready

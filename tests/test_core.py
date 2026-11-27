@@ -3051,7 +3051,7 @@ class TwitchRecorderTests(unittest.TestCase):
 
 
 class FromTheStartTests(unittest.TestCase):
-    """Going back to where a live stream began (YouTube keeps its whole recent past in the playlist)."""
+    """Opening a live YouTube stream at any earlier point (its playlist lists everything YouTube still keeps)."""
 
     @staticmethod
     def long_playlist(n=100, dur=2.0):
@@ -3060,27 +3060,28 @@ class FromTheStartTests(unittest.TestCase):
             lines += [f"#EXTINF:{dur:.3f},", f"http://x/sq/{500 + i}/p.ts"]
         return lines
 
-    def test_edge_can_keep_a_number_of_seconds(self):
+    def test_a_playlist_can_begin_part_way_in(self):
         from marquee.core.streamproxy import _Handler
         lines = self.long_playlist(100)
-        out = _Handler._live_edge(lines, seconds=60)
-        self.assertEqual(sum(1 for l in out if l.startswith("#EXTINF")), 30)          # 60 s of 2 s pieces
-        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:568")                         # 100 listed, 2 held back, 30 kept: starts at 98 - 30
-        self.assertEqual(out[-1], "http://x/sq/597/p.ts")                             # the newest two are held back
-        everything = _Handler._live_edge(lines, seconds=100000)
-        self.assertEqual(everything, lines[:-4])                                      # nothing dropped but the two held back pieces
-        self.assertEqual(_Handler._live_edge(lines)[3], "#EXT-X-MEDIA-SEQUENCE:586")  # the usual short cut is unchanged
+        out, total = _Handler._from_offset(lines, 60)
+        self.assertEqual(total, 196.0)                                  # 100 pieces of 2 s, minus the two the stream is not serving yet
+        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:530")           # 60 s in = piece 30
+        self.assertEqual(out[4:6], ["#EXTINF:2.000,", "http://x/sq/530/p.ts"])
+        self.assertEqual(out[-1], "http://x/sq/597/p.ts")               # the newest two are held back
+        out, _ = _Handler._from_offset(lines, 0)
+        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:500")
+        out, _ = _Handler._from_offset(lines, 10_000)                   # past the end: the last piece, never an empty playlist
+        self.assertEqual(sum(1 for l in out if l.startswith("#EXTINF")), 1)
+        self.assertEqual(_Handler._live_edge(lines)[3], "#EXT-X-MEDIA-SEQUENCE:586")   # the usual start at the live edge is unchanged
 
     @unittest.skipUnless(__import__("shutil").which("ffmpeg") and "libx264" in os.popen("ffmpeg -hide_banner -encoders 2>/dev/null").read(),
                          "needs ffmpeg with libx264")
-    def test_recording_begins_at_the_first_piece_when_asked(self):
+    def test_a_viewer_can_start_anywhere_in_the_past(self):
         import functools
         import http.server
         import subprocess
         from marquee.core import streamproxy
-        old = os.environ.get("XDG_CACHE_HOME")
         with tempfile.TemporaryDirectory() as d:
-            os.environ["XDG_CACHE_HOME"] = d
             os.makedirs(os.path.join(d, "src"))
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=60",
                             "-f", "lavfi", "-i", "sine=frequency=440:duration=60", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac",
@@ -3092,27 +3093,32 @@ class FromTheStartTests(unittest.TestCase):
             threading.Thread(target=web.serve_forever, daemon=True).start()
             proxy = streamproxy.StreamProxy()
             try:
-                src = f"http://127.0.0.1:{web.server_address[1]}/live.m3u8"
-                plain = proxy.dvr(proxy.add_live(src))
-                full = proxy.dvr(proxy.add_live(src, history=3 * 3600), history=3 * 3600)
+                local = proxy.add_live(f"http://127.0.0.1:{web.server_address[1]}/live.m3u8")
+                r = urllib.request.urlopen(local + "?from=20", timeout=10)
+                total = float(r.headers["X-Total-Seconds"])
+                r.close()
+                self.assertGreater(total, 50)
                 got = {}
-                for name, url in (("plain", plain), ("full", full)):
-                    r = urllib.request.urlopen(url + "?back=100000", timeout=60)
-                    r.read(20000)
-                    r.close()
-                    deadline = time.time() + 20
-                    while time.time() < deadline and (proxy.dvr_status(url) or {}).get("live", 0) < 40:
-                        time.sleep(0.3)
-                    got[name] = proxy.dvr_status(url)
-                self.assertLess(got["plain"]["live"], 30)                               # the usual recording only has the newest few pieces
-                self.assertGreaterEqual(got["full"]["live"], 40)                        # this one has the stream from its beginning
-                self.assertEqual(got["full"]["oldest"], 0.0)
+                for off in (0, 30):
+                    url = proxy.retimed(f"{local}?from={off}")
+                    out = os.path.join(d, f"o{off}.ts")
+                    with open(out, "wb") as f:
+                        try:
+                            with urllib.request.urlopen(url, timeout=8) as r:
+                                while True:                                              # until the pieces run out and it waits for new ones
+                                    c = r.read(65536)
+                                    if not c:
+                                        break
+                                    f.write(c)
+                        except OSError:
+                            pass
+                    got[off] = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out],
+                                                    capture_output=True, text=True).stdout.strip() or 0)
+                self.assertAlmostEqual(got[0], total, delta=3)                           # everything YouTube lists
+                self.assertAlmostEqual(got[30], total - 30, delta=3)                     # just what is after 30 seconds
             finally:
                 proxy.stop()
-                if old is None:
-                    os.environ.pop("XDG_CACHE_HOME", None)
-                else:
-                    os.environ["XDG_CACHE_HOME"] = old
+                web.shutdown()
 
 
 class TwitchSavedBroadcastTests(unittest.TestCase):
