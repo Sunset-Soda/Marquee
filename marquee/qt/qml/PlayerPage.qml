@@ -1194,7 +1194,7 @@ Kirigami.Page {
             pp.histTotal = total
             pp.dvr = ({})
             pp.swapSource(url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + (++pp.dvrOpens))
-            if (first) applicationWindow().showPassiveNotification("Going back " + Math.round(total / 60) + " minutes, as far as YouTube keeps this stream. Press Live to return.")
+            if (first) applicationWindow().showPassiveNotification("Going back " + Math.round(total / 60) + " minutes, to where this stream began. Press Live to return.")
         }
         function onHistoryFailed(vid, message) {
             if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
