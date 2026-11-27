@@ -303,18 +303,23 @@ def _stamp(text: str) -> float:
         return 0.0
 
 
-def current_vod(api, login: str) -> dict | None:
+def current_vod(api, login: str, log=None) -> dict | None:
     """The saved copy (past broadcast) Twitch is building of a channel's stream while it is live: {id, created, title}, or None when
     the channel does not save its broadcasts (or keeps them private). `api` is Twitch._api."""
+    say = log or (lambda m: None)
     users = api("users", login=login).get("data") or []
     if not users:
+        say(f"Twitch knows no channel called {login}")
         return None
     uid = users[0]["id"]
     streams = api("streams", user_id=uid).get("data") or []
     if not streams:
+        say("Twitch says the channel is not live")
         return None
     sid, started = str(streams[0].get("id") or ""), _stamp(streams[0].get("started_at", ""))
     vids = api("videos", user_id=uid, type="archive", first=5).get("data") or []
+    say(f"stream {sid} started {streams[0].get('started_at', '')}; Twitch lists {len(vids)} saved broadcast(s): " +
+        "; ".join(f"{v.get('id')} stream_id={v.get('stream_id')} created={v.get('created_at')} dur={v.get('duration')}" for v in vids))
     best = None
     for v in vids:
         if sid and str(v.get("stream_id") or "") == sid:

@@ -413,7 +413,7 @@ class TwitchController(QObject):
         def work():
             found = None
             try:
-                found = tw.current_vod(self._api._api, login)
+                found = tw.current_vod(self._api._api, login, lambda m: _log(f"saved copy: {m}"))
                 _log(f"saved copy of this broadcast: " + (f"found ({found['id']}, started {time.strftime('%H:%M:%S', time.gmtime(found['created']))}Z)" if found
                                                           else "none (the channel does not save broadcasts, or keeps them private)"))
             except Exception as e:
