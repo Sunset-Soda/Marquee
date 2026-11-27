@@ -296,6 +296,116 @@ def resolve(exe: str, login: str, store: Store, cookie_spec: str = "", run=None)
             "heights": sorted({int(f.get("height") or 0) for f in d.get("formats") or [] if f.get("height")}, reverse=True)}
 
 
+def _stamp(text: str) -> float:
+    try:
+        return _epoch(text)
+    except Exception:
+        return 0.0
+
+
+def current_vod(api, login: str) -> dict | None:
+    """The saved copy (past broadcast) Twitch is building of a channel's stream while it is live: {id, created, title}, or None when
+    the channel does not save its broadcasts (or keeps them private). `api` is Twitch._api."""
+    users = api("users", login=login).get("data") or []
+    if not users:
+        return None
+    uid = users[0]["id"]
+    streams = api("streams", user_id=uid).get("data") or []
+    if not streams:
+        return None
+    sid, started = str(streams[0].get("id") or ""), _stamp(streams[0].get("started_at", ""))
+    vids = api("videos", user_id=uid, type="archive", first=5).get("data") or []
+    best = None
+    for v in vids:
+        if sid and str(v.get("stream_id") or "") == sid:
+            best = v
+            break
+    if best is None:                                  # no stream id on it: the one that was created when the stream began
+        near = [v for v in vids if started and abs(_stamp(v.get("created_at", "")) - started) < 600]
+        best = near[0] if near else None
+    if best is None:
+        return None
+    return {"id": str(best["id"]), "created": _stamp(best.get("created_at", "")), "title": best.get("title", "")}
+
+
+def resolve_vod(exe: str, vod_id: str, store: "Store", cookie_spec: str = "", run=None) -> dict:
+    """{url, headers}: the playlist of a saved broadcast, at the same picture size as the live channel."""
+    run = run or (lambda args, timeout: _ytdlp(exe, args, timeout))
+    base = [f"https://www.twitch.tv/videos/{vod_id}"]
+    if store.browser_login and cookie_spec:
+        base = ["--cookies-from-browser", cookie_spec, *base]
+    d = run(base, 40.0)
+    fmt = pick_format(d.get("formats") or [], store.quality)
+    if not fmt:
+        raise TwitchError("Twitch gave no playable saved copy of this broadcast.")
+    return {"url": fmt["url"], "headers": fmt.get("http_headers") or d.get("http_headers") or {}}
+
+
+def cut_vod(text: str, base: str, start: float = 0.0) -> tuple[str, float]:
+    """A saved broadcast's playlist from `start` seconds in: pieces before it are dropped and every address is made absolute.
+    Returns (playlist, total seconds of everything it lists). A playlist that is still growing stays open-ended."""
+    lines = text.splitlines()
+    head, body, ended = [], [], False
+    seq = 0
+    in_body = False
+    for ln in lines:
+        if ln.startswith("#EXT-X-ENDLIST"):
+            ended = True
+            continue
+        if ln.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(ln.split(":", 1)[1])
+            except ValueError:
+                seq = 0
+            continue
+        if ln.startswith(("#EXT-X-PLAYLIST-TYPE", "#EXT-X-MAP")) and not in_body:
+            if ln.startswith("#EXT-X-MAP"):
+                body.append(ln)
+            else:
+                head.append(ln)
+            continue
+        if ln.startswith("#EXTINF"):
+            in_body = True
+        (body if in_body else head).append(ln)
+
+    def absolute(ln: str) -> str:
+        if ln.startswith("#"):
+            return re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % urllib.parse.urljoin(base, m.group(1)), ln)
+        return urllib.parse.urljoin(base, ln.strip()) if ln.strip() else ln
+    groups, cur, cur_map = [], [], ""
+    for ln in body:
+        if ln.startswith("#EXT-X-MAP"):
+            cur_map = absolute(ln)
+            cur.append(cur_map)
+            continue
+        cur.append(absolute(ln))
+        if ln.strip() and not ln.startswith("#"):
+            groups.append((cur_map, cur))
+            cur = []
+    total, t, kept, dropped, first_map = 0.0, 0.0, [], 0, ""
+    for mp, g in groups:
+        dur = 0.0
+        for ln in g:
+            if ln.startswith("#EXTINF:"):
+                try:
+                    dur = float(ln[8:].split(",")[0])
+                except ValueError:
+                    pass
+        if t + dur <= start and len(kept) == 0 and dropped < len(groups) - 1:
+            dropped += 1
+            first_map = mp
+        else:
+            if not kept and first_map and not any(x.startswith("#EXT-X-MAP") for x in g):
+                kept.append(first_map)                 # the start-up data the first kept piece depends on
+            kept.extend(g)
+        t += dur
+    total = t
+    out = head + [f"#EXT-X-MEDIA-SEQUENCE:{seq + dropped}"] + kept
+    if ended:
+        out.append("#EXT-X-ENDLIST")
+    return "\n".join(out) + "\n", total
+
+
 class Recorder:
     """Keeps the last stretch of a Twitch channel on disk so it can be paused, rewound and sent back to live.
 

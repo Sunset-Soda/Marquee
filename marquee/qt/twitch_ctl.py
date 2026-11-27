@@ -27,6 +27,9 @@ class TwitchController(QObject):
     _loginState = Signal(str, str)      # kind ("done" | "failed"), message
     _played = Signal(int, str, object)
     _playFailed = Signal(int, str, str)
+    _vodFound = Signal(int, object)     # token, the saved copy of the stream that is live ({id, created, title}) or None
+    vodReady = Signal(str, float, float)    # an address that plays the saved broadcast from `offset` seconds, and how long it is so far
+    vodFailed = Signal(str)
 
     def __init__(self, youtube, parent=None):
         super().__init__(parent)
@@ -49,6 +52,9 @@ class TwitchController(QObject):
         self._loginState.connect(self._on_login_state)
         self._played.connect(self._on_played)
         self._playFailed.connect(self._on_play_failed)
+        self._vodFound.connect(self._on_vod_found)
+        self._vod: dict | None = None               # the saved copy Twitch is building of this stream, when there is one
+        self._vod_src: dict | None = None           # its playlist address (looked up once, with yt-dlp)
 
     # ---- what the page shows -----------------------------------------------------------------
     @Property(bool, notify=changed)
@@ -133,6 +139,11 @@ class TwitchController(QObject):
     @Property(str, notify=changed)
     def channel(self):
         return self._channel
+
+    @Property(bool, notify=changed)
+    def vodAvailable(self):
+        """True when Twitch is keeping a saved copy of this broadcast that the rewind bar can go back into."""
+        return bool(self._vod)
 
     # ---- settings ----------------------------------------------------------------------------
     @Slot(str)
@@ -290,6 +301,7 @@ class TwitchController(QObject):
         self._token += 1
         token = self._token
         self._channel, self._stream, self._error = login, {}, ""
+        self._vod = self._vod_src = None
         self.changed.emit()
         dlp = self._yt._dlp
         spec = cookie_spec(dlp.browser) if getattr(dlp, "browser", "") else ""
@@ -392,6 +404,62 @@ class TwitchController(QObject):
         self.changed.emit()
         self.streamReady.emit(login)
         self.probe("when it opened")
+        self._look_for_vod(token, login)
+
+    def _look_for_vod(self, token: int, login: str):
+        if not self._store.signed_in:
+            return
+
+        def work():
+            found = None
+            try:
+                found = tw.current_vod(self._api._api, login)
+                _log(f"saved copy of this broadcast: " + (f"found ({found['id']}, started {time.strftime('%H:%M:%S', time.gmtime(found['created']))}Z)" if found
+                                                          else "none (the channel does not save broadcasts, or keeps them private)"))
+            except Exception as e:
+                _log(f"saved copy of this broadcast: could not look ({e})")
+            self._vodFound.emit(token, found)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_vod_found(self, token: int, found):
+        if token != self._token:
+            return
+        self._vod = found
+        self.changed.emit()
+
+    @Slot(float)
+    def vodOpen(self, offset: float):
+        """Play the saved copy of this broadcast from `offset` seconds in (0 = from the very beginning). Answers with vodReady / vodFailed."""
+        vod, token = self._vod, self._token
+        if not vod:
+            self.vodFailed.emit("This channel has no saved copy of the broadcast to go back into.")
+            return
+        dlp = self._yt._dlp
+        spec = cookie_spec(dlp.browser) if getattr(dlp, "browser", "") else ""
+
+        def work():
+            import urllib.request
+            try:
+                src = self._vod_src
+                if not src:
+                    src = self._vod_src = tw.resolve_vod(dlp.exe, vod["id"], self._store, spec)
+                px = self._yt._proxy
+                local = px.add_vod(src["url"], src["headers"])
+                with urllib.request.urlopen(urllib.request.Request(src["url"], headers={"User-Agent": tw.UA}), timeout=15) as r:
+                    text = r.read(8_000_000).decode("utf-8", "replace")
+                _, total = tw.cut_vod(text, src["url"], offset)
+                url = px.retimed(f"{local}?from={max(0.0, offset):.1f}")
+                _log(f"playing the saved broadcast from {offset:.0f}s (it is {total:.0f}s long so far)")
+                if token == self._token:
+                    self.vodReady.emit(url, max(0.0, min(offset, total)), total)
+            except tw.TwitchError as e:
+                self._vod_src = None
+                self.vodFailed.emit(str(e))
+            except Exception as e:
+                self._vod_src = None
+                _log(f"saved broadcast failed: {e!r}")
+                self.vodFailed.emit("Couldn’t open the saved copy of this broadcast.")
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_play_failed(self, token: int, login: str, message: str):
         if token != self._token:
@@ -417,6 +485,7 @@ class TwitchController(QObject):
     @Slot()
     def stop(self):
         self._token += 1
+        self._vod = self._vod_src = None
         self._drop_rec()
         self._channel, self._stream = "", {}
         self.changed.emit()

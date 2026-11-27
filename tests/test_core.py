@@ -3113,3 +3113,83 @@ class FromTheStartTests(unittest.TestCase):
                     os.environ.pop("XDG_CACHE_HOME", None)
                 else:
                     os.environ["XDG_CACHE_HOME"] = old
+
+
+class TwitchSavedBroadcastTests(unittest.TestCase):
+    """Rewinding a Twitch stream to its start through the saved copy Twitch builds while it is live."""
+
+    def vod(self, n=10, ended=False, mapped=False):
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:10", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:EVENT"]
+        if mapped:
+            lines.append('#EXT-X-MAP:URI="init.mp4"')
+        for i in range(n):
+            lines += ["#EXTINF:10.000,", f"{i}.ts"]
+        if ended:
+            lines.append("#EXT-X-ENDLIST")
+        return "\n".join(lines) + "\n"
+
+    def test_cut_starts_at_the_piece_holding_the_time(self):
+        out, total = twitch.cut_vod(self.vod(), "https://cdn.example/v/index.m3u8", 35)
+        self.assertEqual(total, 100.0)
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:3", out)                 # pieces 0-2 end by 30 s; piece 3 holds second 35
+        self.assertIn("https://cdn.example/v/3.ts", out)
+        self.assertNotIn("/2.ts", out)
+        self.assertNotIn("ENDLIST", out)                              # still growing: stays open-ended
+        self.assertIn("ENDLIST", twitch.cut_vod(self.vod(ended=True), "https://cdn.example/v/", 0)[0])
+
+    def test_cut_keeps_the_start_up_data_for_the_first_piece(self):
+        out, _ = twitch.cut_vod(self.vod(mapped=True), "https://cdn.example/v/index.m3u8", 55)
+        self.assertEqual(out.count("#EXT-X-MAP"), 1)
+        self.assertLess(out.index("#EXT-X-MAP"), out.index("https://cdn.example/v/5.ts"))
+        self.assertIn('URI="https://cdn.example/v/init.mp4"', out)
+
+    def test_cut_past_the_end_still_leaves_the_last_piece(self):
+        out, _ = twitch.cut_vod(self.vod(), "https://cdn.example/v/", 9999)
+        self.assertIn("https://cdn.example/v/9.ts", out)
+
+    def test_finds_the_saved_copy_of_this_stream(self):
+        calls = []
+
+        def api(path, **params):
+            calls.append(path)
+            if path == "users":
+                return {"data": [{"id": "42"}]}
+            if path == "streams":
+                return {"data": [{"id": "S2", "started_at": "2026-11-27T01:00:00Z"}]}
+            return {"data": [{"id": "V1", "stream_id": "S1", "created_at": "2026-11-26T01:00:00Z"},
+                             {"id": "V2", "stream_id": "S2", "created_at": "2026-11-27T01:00:05Z", "title": "tonight"}]}
+        self.assertEqual(twitch.current_vod(api, "x")["id"], "V2")
+        none = lambda path, **p: {"data": []} if path != "users" else {"data": [{"id": "1"}]}
+        self.assertIsNone(twitch.current_vod(none, "x"))                # offline, or nothing saved
+
+    def test_falls_back_to_the_creation_time(self):
+        def api(path, **params):
+            if path == "users":
+                return {"data": [{"id": "42"}]}
+            if path == "streams":
+                return {"data": [{"id": "S2", "started_at": "2026-11-27T01:00:00Z"}]}
+            return {"data": [{"id": "OLD", "created_at": "2026-11-25T01:00:00Z"}, {"id": "NEW", "created_at": "2026-11-27T01:00:30Z"}]}
+        self.assertEqual(twitch.current_vod(api, "x")["id"], "NEW")
+
+    def test_proxy_serves_the_cut_playlist(self):
+        import functools
+        import http.server
+        from marquee.core import streamproxy
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "index.m3u8"), "w") as f:
+                f.write(self.vod())
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=d)
+            handler.func.log_message = lambda *a: None
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            proxy = streamproxy.StreamProxy()
+            try:
+                url = proxy.add_vod(f"http://127.0.0.1:{web.server_address[1]}/index.m3u8")
+                r = urllib.request.urlopen(url + "?from=62", timeout=5)
+                body = r.read().decode()
+                self.assertEqual(r.headers["X-Total-Seconds"], "100.0")
+                self.assertIn("#EXT-X-MEDIA-SEQUENCE:6", body)
+                self.assertIn(f"http://127.0.0.1:{web.server_address[1]}/6.ts", body)
+            finally:
+                proxy.stop()
+                web.shutdown()

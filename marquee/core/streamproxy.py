@@ -240,6 +240,35 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):                            # the player closed the connection
             pass
 
+    def _serve_vod(self, head: bool, url: str, headers: dict):
+        """A saved Twitch broadcast's playlist, cut to start `from` seconds in (see core.twitch.cut_vod); its pieces are fetched from Twitch directly."""
+        from urllib.parse import parse_qs, urlsplit
+        from . import twitch
+        try:
+            start = float(parse_qs(urlsplit(self.path).query).get("from", ["0"])[0])
+        except ValueError:
+            start = 0.0
+        try:
+            h = {"User-Agent": twitch.UA, **{k: v for k, v in (headers or {}).items() if k.lower() != "range"}}
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=15) as r:
+                text = r.read(8_000_000).decode("utf-8", "replace")
+            body, total = twitch.cut_vod(text, url, start)
+        except Exception:
+            self.send_error(502)
+            return
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Total-Seconds", f"{total:.1f}")
+        self.end_headers()
+        if not head:
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+
     def _serve_hls(self, head: bool, url: str, part: str, state):
         """The channel ("main") or the commercial break ("ad") of a live playlist, read fresh each time the player asks (see core.twitch.AdState)."""
         import sys
@@ -490,9 +519,9 @@ class _Handler(BaseHTTPRequestHandler):
         if not exe:
             return
         first = []
-        m = re.match(r"http://127\.0\.0\.1:\d+/(s\d+)$", source)
+        m = re.match(r"http://127\.0\.0\.1:\d+/([sv]\d+)(?:/index\.m3u8(?:\?.*)?)?$", source)
         ent = self.server.entries.get(m.group(1)) if m else None   # type: ignore[attr-defined]
-        if ent and ent[0] == "hls":
+        if ent and ent[0] in ("hls", "vod"):
             first = ["-live_start_index", "0", "-analyzeduration", "1500000", "-probesize", "1500000"]                    # start at the first piece listed (a rewound spot), not three from the end
         cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *first, "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
                "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
@@ -637,6 +666,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if entry[0] == "retime":
             self._serve_retimed(head, entry[1])
+            return
+        if entry[0] == "vod":
+            self._serve_vod(head, entry[1], entry[2])
             return
         if entry[0] == "rec":
             parts = self.path.split("?")[0].strip("/").split("/")
@@ -851,6 +883,14 @@ class StreamProxy:
         m = re.search(r"/(d\d+)/live\.ts", url or "")
         d = self._server.dvrs.get(m.group(1)) if m else None      # type: ignore[attr-defined]
         return d.status() if d else None
+
+    def add_vod(self, url: str, headers: dict | None = None) -> str:
+        """The local address of a saved broadcast's playlist; add ?from=SECONDS to start that far in."""
+        s = self._start()
+        self._n += 1
+        token = f"v{self._n}"
+        s.entries[token] = ("vod", url, dict(headers or {}))        # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}/index.m3u8"
 
     def add_rec(self, rec) -> str:
         """Serve a core.twitch.Recorder's pieces; sets rec.base to their address and returns it."""
