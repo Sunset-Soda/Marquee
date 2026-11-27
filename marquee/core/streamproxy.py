@@ -630,7 +630,8 @@ class _Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             threading.Thread(target=feed, daemon=True).start()
-            print(f"[dvr] a viewer joined {back:.0f}s behind live", file=sys.stderr, flush=True)
+            st = dvr.status()
+            print(f"[dvr] a viewer joined {min(back, st['live'] - st['oldest']):.0f}s behind live (the recording holds {st['live'] - st['oldest']:.0f}s so far)", file=sys.stderr, flush=True)
             fd = proc.stdout.fileno()
             while True:
                 data = os.read(fd, 64 * 1024)

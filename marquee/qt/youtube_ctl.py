@@ -19,7 +19,7 @@ class YoutubeController(QObject):
     _progress = Signal(str)
     imported = Signal(int, int)         # channels added, channels already subscribed
     ready = Signal(str)                 # a video's stream address is known: play "yt:<id>"
-    dvrRestarted = Signal(str, str)     # a live stream's recording now starts from the beginning: video id, the new address ("" if that failed)
+    dvrRestarted = Signal(str, str, str)    # a live stream's recording now starts from the beginning: video id, the new address ("" if that failed), a note for the person
     shortReady = Signal(str)            # the same for a Short, which plays inside the Shorts page instead
     shortFailed = Signal(str, str)      # a Short's id and why it could not be opened
     _done = Signal(str, object)
@@ -770,7 +770,7 @@ class YoutubeController(QObject):
         key = f"yt:{video_id}"
 
         def work():
-            new = ""
+            new, note = "", ""
             try:
                 try:
                     secs = float(os.environ.get("MARQUEE_DVR_START_MINUTES") or 180) * 60
@@ -787,10 +787,22 @@ class YoutubeController(QObject):
                     info["url"] = made
                     self._proxy.stop_dvr(old)
                 new = made
-                print(f"[dvr] recording {video_id} from the beginning (up to {secs / 60:.0f} minutes back)", file=sys.stderr, flush=True)
+                try:                                             # how far back the playlist we are recording from really reaches
+                    import urllib.request
+                    with urllib.request.urlopen(local, timeout=30) as r:
+                        rows = r.read().decode("utf-8", "replace").splitlines()
+                    span = sum(float(l[8:].split(",")[0]) for l in rows if l.startswith("#EXTINF:"))
+                    n = sum(1 for l in rows if l.startswith("#EXTINF:"))
+                    mins = round(span / 60)
+                    note = (f"Going back {mins} minutes, the most Marquee keeps (MARQUEE_DVR_START_MINUTES raises it)." if span >= secs - 60
+                            else f"Going back {mins} minutes, as far as YouTube keeps this stream.")
+                    print(f"[dvr] {video_id}: the playlist reaches back {span / 60:.0f} minutes ({n} pieces of about {span / max(1, n):.1f}s); cap is {secs / 60:.0f} minutes",
+                          file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[dvr] could not measure how far back the stream goes: {e}", file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[dvr] could not start from the beginning: {e}", file=sys.stderr, flush=True)
-            self.dvrRestarted.emit(video_id, new)
+            self.dvrRestarted.emit(video_id, new, note)
         threading.Thread(target=work, daemon=True).start()
 
     def _live_address(self, video_id: str):

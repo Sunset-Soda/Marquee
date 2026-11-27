@@ -1147,7 +1147,7 @@ Kirigami.Page {
     }
     Connections {
         target: youtube
-        function onDvrRestarted(vid, url) {
+        function onDvrRestarted(vid, url, note) {
             if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
             pp.startingOver = false
             if (url) {
@@ -1155,6 +1155,7 @@ Kirigami.Page {
                 pp.dvrFor = pp.info.id
                 pp.dvr = ({})
                 pp.attach(100000000)                         // as far back as there is: the first piece
+                if (note) applicationWindow().showPassiveNotification(note)
             } else applicationWindow().showPassiveNotification("Could not go back to the start of this broadcast.")
         }
     }
