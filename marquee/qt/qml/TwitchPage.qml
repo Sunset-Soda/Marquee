@@ -295,15 +295,25 @@ Kirigami.Page {
                         Layout.fillWidth: true
                         from: 0
                         to: Math.max(1, pg.dvr.live - pg.dvr.oldest)
+                        // The handle follows the picture, except while you hold it. A click or drag that really moved it rewinds to there;
+                        // letting go without having moved it does nothing.
+                        function follow() { if (!pressed && !pg.scrubbing) value = Math.max(0, to - pg.behind) }
+                        Component.onCompleted: follow()
+                        onToChanged: follow()
+                        Connections { target: pg; function onBehindChanged() { rewSlider.follow() } }
                         onPressedChanged: {
-                            if (pressed) pg.scrubbing = true
-                            else if (pg.scrubbing) {
-                                pg.scrubbing = false
+                            if (pressed) {
+                                pg.scrubbing = true
+                            } else if (pg.scrubbing) {
                                 var back = to - value
-                                pg.openMain(back < 8 ? 0 : back)
+                                var now = pg.behind
+                                pg.scrubbing = false
+                                if (Math.abs(back - now) > 3) {
+                                    console.log("marquee: twitch: slider released at " + Math.round(back) + "s behind (was " + Math.round(now) + "s)")
+                                    pg.openMain(back < 8 ? 0 : back)
+                                } else follow()
                             }
                         }
-                        Binding { target: rewSlider; property: "value"; value: Math.max(0, rewSlider.to - pg.behind); when: !pg.scrubbing }
                         QQC2.ToolTip.text: pg.fmtBehind(rewSlider.to - rewSlider.value)
                         QQC2.ToolTip.visible: pressed
                     }
