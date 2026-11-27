@@ -373,7 +373,9 @@ class TwitchController(QObject):
         st = rec.status()
         target = st["live"] - (back if back > 0 else 6.0)
         target = max(target, st["oldest"])
-        return self._ads.seek(rec.text(), target)
+        in_ad = self._ads.seek(rec.text(), target)
+        _log(f"seek: {back:.0f}s back -> {st['live'] - target:.0f}s behind live (kept {st['live'] - st['oldest']:.0f}s)" + ("; that is inside a commercial break, playing it first" if in_ad else ""))
+        return in_ad
 
     @Slot()
     def stopRecording(self):

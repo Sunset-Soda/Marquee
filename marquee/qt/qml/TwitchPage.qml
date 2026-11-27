@@ -71,6 +71,7 @@ Kirigami.Page {
         inAd = twitch.seekBack(back)
         opens++
         syncPart()
+        console.log("marquee: twitch: opening at " + Math.round(back) + "s behind live; piece starts at stream time " + Math.round(partStart) + (inAd ? " (break)" : ""))
         player.source = (inAd ? twitch.stream.adUrl : twitch.stream.url) + "?" + opens
         player.play()
     }

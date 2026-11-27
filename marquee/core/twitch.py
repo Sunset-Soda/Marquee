@@ -361,7 +361,7 @@ class Recorder:
         text = self._fetch(self.url)
         head, segs, _ = _parse(text, self.url)
         for line in text.splitlines():
-            if line.startswith("#EXT-X-DATERANGE"):
+            if line.startswith("#EXT-X-DATERANGE") and 'CLASS="twitch-stitched-ad"' in line:   # only the breaks matter (the other tags are new every second)
                 m = re.search(r'ID="([^"]+)"', line)
                 self.ranges.setdefault(m.group(1) if m else line, line.strip())
         added = 0
