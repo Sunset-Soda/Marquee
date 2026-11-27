@@ -296,6 +296,185 @@ def resolve(exe: str, login: str, store: Store, cookie_spec: str = "", run=None)
             "heights": sorted({int(f.get("height") or 0) for f in d.get("formats") or [] if f.get("height")}, reverse=True)}
 
 
+class Recorder:
+    """Keeps the last stretch of a Twitch channel on disk so it can be paused, rewound and sent back to live.
+
+    Twitch's playlist only lists the last few pieces. This polls it, saves every new piece (commercial breaks included, so
+    they still play in full) and serves a longer playlist of what it holds, in the same form Twitch's own playlist has."""
+
+    IDLE = 900
+
+    def __init__(self, url: str, window: float = 3600.0, fetch=None, get=None, folder=None, poll: float = 1.0):
+        import threading
+        self.url = url
+        self.window = window
+        self._fetch = fetch or fetch_playlist
+        self._get = get or self._http_get
+        self._poll = poll
+        if folder is None:
+            import tempfile
+            from .library import cache_dir
+            root = cache_dir() / "live"
+            root.mkdir(parents=True, exist_ok=True)
+            folder = tempfile.mkdtemp(prefix="twitch-", dir=str(root))
+        self.folder = str(folder)
+        self.base = ""                                      # the address the pieces are served from (set by the proxy)
+        self.segs: list[dict] = []                          # {n, key, pdt, dur, name}
+        self.ranges: dict[str, str] = {}                    # DATERANGE lines by id
+        self.count = 0                                      # pieces saved so far (names them)
+        self._seen: set[str] = set()
+        self.unsupported = False
+        self.ended = False
+        self.stopped = False
+        self.last_use = time.monotonic()
+        self._fails = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def _http_get(url: str) -> bytes:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.read()
+
+    def start(self) -> "Recorder":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self.stopped and not self.ended:
+            if time.monotonic() - self.last_use > self.IDLE:
+                break
+            try:
+                self.step()
+                self._fails = 0
+            except Exception:
+                self._fails += 1
+                if self._fails >= 10:
+                    self.ended = True
+            time.sleep(self._poll)
+        self.stop()
+
+    def step(self) -> int:
+        """One look at the channel's playlist; saves what is new. Returns how many pieces were added."""
+        text = self._fetch(self.url)
+        head, segs, _ = _parse(text, self.url)
+        for line in text.splitlines():
+            if line.startswith("#EXT-X-DATERANGE"):
+                m = re.search(r'ID="([^"]+)"', line)
+                self.ranges.setdefault(m.group(1) if m else line, line.strip())
+        added = 0
+        for pdt, lines, mp in segs:
+            url = lines[-1]
+            if url in self._seen:
+                continue
+            if mp or pdt is None:
+                self.unsupported = True                     # pieces that need start-up data, or carry no clock, cannot be stitched back
+                return added
+            if self.stopped:
+                break
+            data = self._get(url)
+            dur = 2.0
+            for ln in lines:
+                if ln.startswith("#EXTINF:"):
+                    try:
+                        dur = float(ln[8:].split(",")[0])
+                    except ValueError:
+                        pass
+            name = "%06d.ts" % self.count
+            with open(os.path.join(self.folder, name), "wb") as f:
+                f.write(data)
+            with self._lock:
+                self._seen.add(url)
+                self.segs.append({"n": self.count, "key": url, "pdt": pdt, "dur": dur, "name": name,
+                                  "disc": any(ln.startswith("#EXT-X-DISCONTINUITY") for ln in lines)})
+                self.count += 1
+            added += 1
+        if re.search(r"^#EXT-X-ENDLIST", text, re.M):
+            self.ended = True
+        self._prune()
+        return added
+
+    def _prune(self) -> None:
+        with self._lock:
+            if not self.segs:
+                return
+            live = self.segs[-1]["pdt"] + self.segs[-1]["dur"]
+            drop = []
+            while len(self.segs) > 3 and self.segs[0]["pdt"] < live - self.window:
+                drop.append(self.segs.pop(0))
+        for d in drop:
+            try:
+                os.remove(os.path.join(self.folder, d["name"]))
+            except OSError:
+                pass
+
+    def touch(self) -> None:
+        self.last_use = time.monotonic()
+
+    def wait(self, timeout: float = 10.0, need: int = 3) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.unsupported:
+                return False
+            if len(self.segs) >= need:
+                return True
+            time.sleep(0.1)
+        return len(self.segs) >= need
+
+    def usable(self) -> bool:
+        return not self.unsupported and bool(self.segs)
+
+    def text(self) -> str:
+        """Everything held, as one playlist (pieces are named relative to `base`)."""
+        self.touch()
+        with self._lock:
+            segs = list(self.segs)
+            ranges = list(self.ranges.values())
+        if not segs:
+            return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % (int(max(s["dur"] for s in segs)) + 1),
+               "#EXT-X-MEDIA-SEQUENCE:%d" % segs[0]["n"]]
+        t0 = segs[0]["pdt"]
+        for r in ranges:
+            m = re.search(r'START-DATE="([^"]+)"', r)
+            d = re.search(r'DURATION=([\d.]+)', r)
+            try:
+                end = _epoch(m.group(1)) + float(d.group(1)) if m and d else t0
+            except ValueError:
+                end = t0
+            if end >= t0 - 1:
+                out.append(r)
+        from datetime import datetime, timezone
+        for s in segs:
+            if s["disc"]:
+                out.append("#EXT-X-DISCONTINUITY")
+            out.append("#EXT-X-PROGRAM-DATE-TIME:" + datetime.fromtimestamp(s["pdt"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+            out.append("#EXTINF:%.3f," % s["dur"])
+            out.append(s["name"])
+        if self.ended:
+            out.append("#EXT-X-ENDLIST")
+        return "\n".join(out) + "\n"
+
+    def status(self) -> dict:
+        with self._lock:
+            if not self.segs:
+                return {"alive": False, "oldest": 0.0, "live": 0.0}
+            return {"alive": not self.unsupported, "oldest": self.segs[0]["pdt"], "live": self.segs[-1]["pdt"] + self.segs[-1]["dur"]}
+
+    def file(self, name: str) -> str | None:
+        self.touch()
+        if not re.fullmatch(r"\d{6}\.ts", name or ""):
+            return None
+        p = os.path.join(self.folder, name)
+        return p if os.path.isfile(p) else None
+
+    def stop(self) -> None:
+        self.stopped = True
+        import shutil
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+
 def fetch_playlist(url: str, timeout: float = 8.0) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -473,6 +652,17 @@ class AdState:
         if self.ad:
             self.floor = self.ad[1]
         self.ad = None
+
+    rec = None                                              # a Recorder, when the channel is being recorded
+
+    def seek(self, text: str, t: float) -> bool:
+        """Move playback to stream time `t`. True when `t` falls inside a break (the break is then played from its start)."""
+        for w in ad_windows(text):
+            if w[0] - 0.05 <= t < w[1]:
+                self.ad, self.floor = w, w[0]
+                return True
+        self.floor, self.ad = t, None
+        return False
 
 
 def fetch_playlist(url: str, timeout: float = 8.0) -> str:

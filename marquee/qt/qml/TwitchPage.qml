@@ -43,7 +43,36 @@ Kirigami.Page {
     function compact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "K" : String(n) }
 
     Component.onCompleted: { if (twitch.signedIn) twitch.refresh(); showSettings = !twitch.signedIn && twitch.clientId === "" }
-    Component.onDestruction: player.stop()
+    Component.onDestruction: { player.stop(); twitch.stopRecording() }
+
+    // ---- pause / rewind / Live (the channel is kept on disk while you watch) ----
+    property var dvr: ({ alive: false })
+    property real partStart: 0                      // stream time at which the playlist now playing began (the channel's floor, or the break's start)
+    property bool scrubbing: false
+    readonly property real behind: dvr.alive ? Math.max(0, dvr.live - (partStart + player.position / 1000)) : 0
+    function syncPart() {
+        var st = twitch.dvrStatus()
+        dvr = st
+        partStart = st.alive ? (inAd ? st.adStart : st.floor) : 0
+    }
+    // play the channel from `back` seconds behind live (0 = live); a break that falls there plays first
+    function openMain(back) {
+        stillFor = 0; lastPos = -1; posMoved = false; ticks = 0; nudges = 0
+        player.stop()
+        inAd = twitch.seekBack(back)
+        opens++
+        syncPart()
+        player.source = (inAd ? twitch.stream.adUrl : twitch.stream.url) + "?" + opens
+        player.play()
+    }
+    Timer {
+        interval: 1000; repeat: true; running: pg.phase === "playing"
+        onTriggered: if (!pg.scrubbing) pg.dvr = twitch.dvrStatus()
+    }
+    function fmtBehind(s) {
+        s = Math.round(s)
+        return "-" + Math.floor(s / 60) + ":" + (s % 60 < 10 ? "0" : "") + (s % 60)
+    }
 
     Timer { interval: 60000; repeat: true; running: pg.visible && pg.phase === "browse" && twitch.signedIn; onTriggered: twitch.refresh() }
 
@@ -52,6 +81,7 @@ Kirigami.Page {
         function onStreamReady(login) {
             if (pg.phase !== "loading") return
             pg.inAd = !!twitch.stream.startsInAd
+            pg.syncPart()
             player.source = pg.inAd ? twitch.stream.adUrl : twitch.stream.url
             player.play()
             pg.phase = "playing"
@@ -78,11 +108,13 @@ Kirigami.Page {
                     console.log("marquee: twitch: the commercial break is over; back to the channel")
                     pg.inAd = false
                     twitch.advance()
+                    pg.syncPart()
                     pg.opens++
                     player.source = twitch.stream.url + "?" + pg.opens
                 } else {
                     console.log("marquee: twitch: a commercial break is next; playing it")
                     pg.inAd = true
+                    pg.syncPart()
                     pg.opens++
                     player.source = twitch.stream.adUrl + "?" + pg.opens
                 }
@@ -99,7 +131,7 @@ Kirigami.Page {
             else if (playbackState === MediaPlayer.PlayingState && pg.pausedAt > 0) {
                 var longPause = Date.now() - pg.pausedAt > 15000
                 pg.pausedAt = 0
-                if (longPause && pg.phase === "playing") { console.log("marquee: twitch: resumed after a pause; going back to live"); Qt.callLater(function () { pg.watch(twitch.channel) }) }
+                if (longPause && pg.phase === "playing" && !pg.dvr.alive) { console.log("marquee: twitch: resumed after a pause; going back to live"); Qt.callLater(function () { pg.watch(twitch.channel) }) }
             }
         }
     }
@@ -159,7 +191,10 @@ Kirigami.Page {
         posMoved = false
         ticks = 0
         twitch.probe(why)
-        if (reconnects <= 3 && twitch.stream.url) {
+        if (reconnects <= 3 && twitch.stream.url && dvr.alive) {
+            console.log("marquee: twitch: " + why + "; reopening where it was (" + reconnects + ")")
+            openMain(behind < 6 ? 0 : behind)
+        } else if (reconnects <= 3 && twitch.stream.url) {
             // Same stream address again: by now the commercial break has left its playlist, so it carries on with the channel.
             // (Asking Twitch for a new stream instead would start with a new commercial break.)
             console.log("marquee: twitch: " + why + "; reopening the stream (" + reconnects + ")")
@@ -229,9 +264,9 @@ Kirigami.Page {
                 QQC2.ToolButton {
                     visible: pg.phase === "playing"
                     text: "● Live"
-                    highlighted: player.playbackState !== MediaPlayer.PlayingState
-                    onClicked: pg.watch(twitch.channel)
-                    QQC2.ToolTip.text: "Jump back to the live broadcast (also reloads the stream)"; QQC2.ToolTip.visible: hovered
+                    highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
+                    onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
+                    QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
                 }
                 QQC2.Label { text: twitch.stream.height ? twitch.stream.height + "p" : ""; color: "white"; opacity: 0.8 }
                 QQC2.ComboBox {
@@ -255,8 +290,48 @@ Kirigami.Page {
                 }
             }
         }
+        // rewind bar: the left end is the oldest moment kept, the right end is live
+        Rectangle {
+            id: rewind
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+            height: rewRow.implicitHeight + Kirigami.Units.largeSpacing * 2
+            visible: pg.phase === "playing" && pg.dvr.alive
+            gradient: Gradient {
+                GradientStop { position: 0; color: "transparent" }
+                GradientStop { position: 1; color: "#cc000000" }
+            }
+            RowLayout {
+                id: rewRow
+                anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: Kirigami.Units.largeSpacing }
+                QQC2.ToolButton {
+                    icon.name: player.playbackState === MediaPlayer.PlayingState ? "media-playback-pause" : "media-playback-start"
+                    onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
+                }
+                QQC2.Slider {
+                    id: rewSlider
+                    Layout.fillWidth: true
+                    from: 0
+                    to: Math.max(1, pg.dvr.live - pg.dvr.oldest)
+                    onPressedChanged: {
+                        if (pressed) pg.scrubbing = true
+                        else if (pg.scrubbing) {
+                            pg.scrubbing = false
+                            var back = to - value
+                            pg.openMain(back < 8 ? 0 : back)
+                        }
+                    }
+                }
+                Binding { target: rewSlider; property: "value"; value: Math.max(0, rewSlider.to - pg.behind); when: !pg.scrubbing }
+                QQC2.Label {
+                    color: "white"
+                    Layout.minimumWidth: Kirigami.Units.gridUnit * 3
+                    horizontalAlignment: Text.AlignRight
+                    text: pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : "Live")
+                }
+            }
+        }
         QQC2.Label {
-            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: Kirigami.Units.largeSpacing }
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; bottomMargin: pg.dvr.alive ? rewind.height : Kirigami.Units.largeSpacing; leftMargin: Kirigami.Units.largeSpacing; rightMargin: Kirigami.Units.largeSpacing }
             visible: pg.phase === "playing" && !!(twitch.stream.note || twitch.stream.adfree)
             color: "white"
             opacity: 0.85

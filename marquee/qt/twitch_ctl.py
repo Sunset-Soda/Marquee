@@ -307,9 +307,18 @@ class TwitchController(QObject):
             try:                                            # breaks and the channel are separate videos: play each as its own playlist
                 text = tw.fetch_playlist(info["url"])
                 state = tw.AdState()
-                starts_in_ad = state.open(text, info["url"])
                 px = self._yt._proxy
+                rec = self._record(info["url"], px)
+                if rec:
+                    state.rec = rec
+                    text = rec.text()
+                    starts_in_ad = state.open(text, rec.base)
+                    if not starts_in_ad:                                # begin close to live, not at the oldest piece held
+                        starts_in_ad = state.seek(text, max(state.floor, rec.status()["live"] - 6.0))
+                else:
+                    starts_in_ad = state.open(text, info["url"])
                 self._ads = state
+                self._pending_rec = rec
                 info = dict(info, raw=info["url"], startsInAd=starts_in_ad, adUrl=px.retimed(px.add_hls(info["url"], "ad", state)), url=px.retimed(px.add_hls(info["url"], "main", state)))
                 if starts_in_ad:
                     _log(f"{login}: the stream opens with a commercial break; playing it, then the channel")
@@ -318,8 +327,63 @@ class TwitchController(QObject):
             self._played.emit(token, login, info)
         threading.Thread(target=work, daemon=True).start()
 
+    def _record(self, url: str, px):
+        """Start keeping the channel on disk (for pause / rewind / Live); None when that is off or not possible."""
+        import os
+        if os.environ.get("MARQUEE_DVR") == "0":
+            return None
+        try:
+            mins = float(os.environ.get("MARQUEE_DVR_MINUTES", "30"))
+        except ValueError:
+            mins = 30.0
+        self._drop_rec()
+        rec = tw.Recorder(url, window=mins * 60)
+        px.add_rec(rec)
+        rec.start()
+        if not rec.wait(12):
+            _log("recording not available for this stream; playing without pause/rewind")
+            rec.stop()
+            return None
+        self._rec = rec
+        _log(f"recording the last {mins:.0f} minutes (pause / rewind / Live)")
+        return rec
+
+    def _drop_rec(self):
+        rec = getattr(self, "_rec", None)
+        self._rec = None
+        if rec:
+            rec.stop()
+
+    @Slot(result="QVariantMap")
+    def dvrStatus(self) -> dict:
+        rec = getattr(self, "_rec", None)
+        if not rec or rec.stopped:
+            return {"alive": False}
+        rec.touch()                                         # the page asks every second while it is open: that keeps the recording going through a long pause
+        st = rec.status()
+        a = self._ads.ad if self._ads and self._ads.ad else None
+        return dict(st, floor=self._ads.floor if self._ads else 0.0, adStart=a[0] if a else 0.0, adEnd=a[1] if a else 0.0, ended=rec.ended)
+
+    @Slot(float, result=bool)
+    def seekBack(self, back: float) -> bool:
+        """Move to `back` seconds behind live (0 = live). True when that spot is inside a commercial break (play the break first)."""
+        rec = getattr(self, "_rec", None)
+        if not rec or not self._ads:
+            return False
+        st = rec.status()
+        target = st["live"] - (back if back > 0 else 6.0)
+        target = max(target, st["oldest"])
+        return self._ads.seek(rec.text(), target)
+
+    @Slot()
+    def stopRecording(self):
+        self._drop_rec()
+
     def _on_played(self, token: int, login: str, info):
         if token != self._token:
+            rec = getattr(self, "_pending_rec", None)
+            if rec and rec is not getattr(self, "_rec", None):
+                rec.stop()
             return                                          # you opened something else meanwhile
         _log(f"{login}: {info['height']}p" + (", ad-free route" if info["adfree"] else "") + (f" ({info['note']})" if info["note"] else ""))
         self._stream = dict(info, login=login)
@@ -351,5 +415,6 @@ class TwitchController(QObject):
     @Slot()
     def stop(self):
         self._token += 1
+        self._drop_rec()
         self._channel, self._stream = "", {}
         self.changed.emit()
