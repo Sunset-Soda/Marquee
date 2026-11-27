@@ -39,6 +39,7 @@ Kirigami.Page {
     property real histTotal: 0                      // how long that stretch is
     readonly property real histAt: Math.min(histTotal, histOffset + videoPlayer.position / 1000)
     property bool startingOver: false
+    property bool freezing: false                   // the last picture is held on screen while a new position loads
     property bool dvrScrub: false                   // the rewind bar's handle is held
     readonly property bool dvrOn: !!info.isLive && !!info.dvr && !!dvr.alive
     // how far behind the live edge the picture is, in seconds
@@ -246,8 +247,23 @@ Kirigami.Page {
     // join the recording `back` seconds behind live (0 = the live edge) without asking YouTube for anything new
     function attach(back) {
         pausedAt = 0; liveStill = 0; liveLast = -1
-        videoPlayer.source = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
-        videoPlayer.play()
+        var url = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
+        swapSource(url)
+    }
+    // Switch to another stretch of the same stream without a black flash: the picture now showing is kept as a still
+    // until the new one has moved, like a seek in an ordinary video.
+    function swapSource(url) {
+        function go() {
+            videoPlayer.source = url
+            videoPlayer.play()
+        }
+        if (!video.visible || video.width < 2 || videoPlayer.playbackState === MediaPlayer.StoppedState) { go(); return }
+        video.grabToImage(function (r) {
+            stillFrame.source = r.url
+            freezing = true
+            freezeTimeout.restart()
+            go()
+        })
     }
     function nudge(seconds) {                          // seconds > 0 goes forward
         if (histMode) youtube.historyOpen(info.id.substring(3), Math.max(0, Math.min(histTotal, histAt + seconds)))
@@ -651,6 +667,19 @@ Kirigami.Page {
             fillMode: VideoOutput.PreserveAspectFit
             TapHandler { onTapped: pp.toggle(); onDoubleTapped: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
         }
+        Image {                                          // the held picture while a new position loads
+            id: stillFrame
+            anchors.fill: parent
+            visible: pp.freezing && source != ""
+            fillMode: Image.PreserveAspectFit
+            cache: false
+            z: 1
+            Timer { id: freezeTimeout; interval: 12000; onTriggered: pp.freezing = false }
+            Connections {
+                target: videoPlayer
+                function onPositionChanged() { if (pp.freezing && videoPlayer.position > 400 && videoPlayer.playbackState === MediaPlayer.PlayingState) pp.freezing = false }
+            }
+        }
 
         // Subtitles sit on the picture, so they use fixed light-on-dark colours rather than the desktop theme.
         Rectangle {
@@ -880,7 +909,7 @@ Kirigami.Page {
             }
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
-                visible: !pp.isLive && !pp.dvrOn
+                visible: !pp.isLive && !pp.dvrOn && !pp.histMode
                 QQC2.Label { text: pp.fmt(player.position) }
                 QQC2.Slider {
                     id: seek
@@ -1164,9 +1193,7 @@ Kirigami.Page {
             pp.histOffset = offset
             pp.histTotal = total
             pp.dvr = ({})
-            videoPlayer.stop()
-            videoPlayer.source = url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + (++pp.dvrOpens)
-            videoPlayer.play()
+            pp.swapSource(url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + (++pp.dvrOpens))
             if (first) applicationWindow().showPassiveNotification("Going back " + Math.round(total / 60) + " minutes, as far as YouTube keeps this stream. Press Live to return.")
         }
         function onHistoryFailed(vid, message) {
