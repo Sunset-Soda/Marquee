@@ -432,9 +432,63 @@ Kirigami.Page {
             // search results: videos, or channels
             Item {
                 VideoGrid {
+                    id: resultsGrid
                     anchors.fill: parent
                     visible: page.searchMode !== 1 && page.searchMode !== 3
                     model: youtube.results
+                    // playlists that match the search, in a row above the videos
+                    header: ColumnLayout {
+                        id: shelf
+                        readonly property var lists: page.searchMode === 0 ? (youtube.playlistResults || []).slice(0, 12) : []
+                        width: resultsGrid.width
+                        visible: lists.length > 0
+                        height: visible ? implicitHeight : 0
+                        spacing: Kirigami.Units.smallSpacing
+                        QQC2.Label { Layout.leftMargin: Kirigami.Units.largeSpacing; text: "Playlists"; font.weight: Font.DemiBold; opacity: 0.8 }
+                        ListView {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: Kirigami.Units.gridUnit * 9.5
+                            orientation: ListView.Horizontal
+                            clip: true
+                            spacing: Kirigami.Units.smallSpacing
+                            leftMargin: Kirigami.Units.smallSpacing
+                            model: shelf.lists
+                            boundsBehavior: Flickable.StopAtBounds
+                            WheelHandler {
+                                acceptedDevices: PointerDevice.Mouse
+                                onWheel: event => parent.flick(event.angleDelta.y * 14, 0)
+                            }
+                            QQC2.ScrollBar.horizontal: QQC2.ScrollBar {}
+                            delegate: QQC2.ItemDelegate {
+                                id: shelfCard
+                                required property var modelData
+                                width: Kirigami.Units.gridUnit * 11
+                                height: ListView.view.height - Kirigami.Units.gridUnit * 0.8
+                                onClicked: youtube.openPlaylist(modelData.id, modelData.title)
+                                contentItem: ColumnLayout {
+                                    spacing: Kirigami.Units.smallSpacing
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: width * 9 / 16
+                                        radius: Kirigami.Units.cornerRadius
+                                        color: page.inkA(0.1)
+                                        clip: true
+                                        Image { anchors.fill: parent; source: shelfCard.modelData.thumb; fillMode: Image.PreserveAspectCrop; asynchronous: true; sourceSize.width: 360; visible: status === Image.Ready }
+                                        Kirigami.Icon { anchors.centerIn: parent; visible: !shelfCard.modelData.thumb; source: "view-media-playlist"; width: Kirigami.Units.iconSizes.large; height: width }
+                                        Rectangle {
+                                            visible: shelfCard.modelData.count > 0
+                                            anchors { right: parent.right; bottom: parent.bottom; margins: 6 }
+                                            width: shelfCount.implicitWidth + 10; height: shelfCount.implicitHeight + 4; radius: 4; color: "#cc000000"
+                                            Text { id: shelfCount; anchors.centerIn: parent; text: shelfCard.modelData.count + " videos"; color: "white"; font.pixelSize: 12; font.weight: Font.DemiBold }
+                                        }
+                                    }
+                                    QQC2.Label { Layout.fillWidth: true; text: shelfCard.modelData.title; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.weight: Font.DemiBold }
+                                    Item { Layout.fillHeight: true }
+                                }
+                            }
+                        }
+                        QQC2.Label { Layout.leftMargin: Kirigami.Units.largeSpacing; Layout.topMargin: Kirigami.Units.smallSpacing; text: "Videos"; font.weight: Font.DemiBold; opacity: 0.8 }
+                    }
                     busy: youtube.busySearch
                     emptyTitle: youtube.error !== "" ? "Search failed" : "Search YouTube"
                     emptyText: youtube.error !== "" ? youtube.error : "Type in the box at the top and press Enter."

@@ -50,6 +50,9 @@ class YoutubeController(QObject):
         self._pl_results: list[dict] = []
         self._playlist: dict = {}
         self._queue: list[str] = []                 # video ids that play one after another (a playlist)
+        self._queue_info: list[dict] = []           # the same videos with their titles and pictures, for the list beside the player
+        self._queue_title = ""
+        self._queue_open = False                    # the playlist panel beside the picture is showing (kept here: the player page is rebuilt now and then)
         self._known: dict[str, dict] = {}
         self._shorts: set[str] = set()              # ids being opened for the Shorts page (waiting or running)
         self._short_run: set[str] = set()           # ... the ones being fetched right now
@@ -469,7 +472,9 @@ class YoutubeController(QObject):
         if channels:
             self._job("channels", lambda: self._dlp.search_channels(query), replace=True)
         else:
+            self._pl_results = []
             self._job("search", lambda: self._dlp.search(query), replace=True)
+            self._job("plsearch", lambda: self._dlp.search_playlists(query, 12), replace=True)     # playlists that match show above the videos
 
     @Slot(str, result=bool)
     def openUrl(self, text: str):
@@ -548,7 +553,26 @@ class YoutubeController(QObject):
     def playInPlaylist(self, vid: str):
         """Play a video from the open playlist; the rest of the list follows it."""
         self._queue = [v["id"] for v in self._playlist.get("videos", [])]
+        self._queue_info = list(self._playlist.get("videos", []))
+        self._queue_title = self._playlist.get("title", "")
         self.play(vid)
+
+    @Property("QVariant", notify=changed)
+    def queue(self):
+        """The playlist being played, for the list beside the picture: {title, videos}. Empty when no playlist is playing."""
+        if not self._queue:
+            return {"title": "", "videos": []}
+        return {"title": self._queue_title, "videos": self._dress(self._queue_info)}
+
+    @Property(bool, notify=changed)
+    def queueOpen(self):
+        return self._queue_open
+
+    @Slot(bool)
+    def setQueueOpen(self, on: bool):
+        if on != self._queue_open:
+            self._queue_open = on
+            self.changed.emit()
 
     def _neighbor(self, vid: str, delta: int) -> str:
         try:

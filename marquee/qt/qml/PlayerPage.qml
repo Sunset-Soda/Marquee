@@ -69,6 +69,15 @@ Kirigami.Page {
         console.log("marquee: captions: page opened for " + info.id + "; controller has " + youtube.captionVideo + " / " + youtube.captionTrack)
         if (!info.yt || !info.id || youtube.captionVideo !== info.id.substring(3)) youtube.clearCaption()
     }
+    readonly property bool listOpen: youtube.queueOpen      // the playlist beside the picture (kept in the controller: this page is rebuilt now and then)
+    readonly property var queueData: youtube.queue
+    readonly property int queueIndex: {
+        var vs = (queueData && queueData.videos) || []
+        for (var i = 0; i < vs.length; i++) if (!!info.id && "yt:" + vs[i].id === info.id) return i
+        return -1
+    }
+    onListOpenChanged: if (listOpen) infoOpen = false
+    onInfoOpenChanged: if (infoOpen && listOpen) youtube.setQueueOpen(false)
     property bool infoOpen: false                  // the side panel with a YouTube video's description, chapters and comments
     property int infoTab: 0
     function seekTo(seconds) { if (pp.player && !pp.isLive) pp.player.position = seconds * 1000 }
@@ -569,7 +578,8 @@ Kirigami.Page {
     Shortcut { sequences: ["N"]; onActivated: pp.step(1) }
     Shortcut { sequences: ["P"]; onActivated: pp.step(-1) }
     Shortcut { sequences: ["F", "F11"]; onActivated: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
-    Shortcut { sequences: ["Escape"]; onActivated: pp.infoOpen ? pp.infoOpen = false : pp.leave() }
+    Shortcut { sequences: ["Escape"]; onActivated: pp.listOpen ? youtube.setQueueOpen(false) : (pp.infoOpen ? pp.infoOpen = false : pp.leave()) }
+    Shortcut { sequences: ["Q"]; enabled: pp.isVideo && pp.queueIndex >= 0; onActivated: youtube.setQueueOpen(!pp.listOpen) }
     Shortcut { sequences: ["I"]; enabled: pp.isVideo && !!pp.info.yt; onActivated: pp.infoOpen = !pp.infoOpen }
 
     Rectangle {
@@ -1002,6 +1012,16 @@ Kirigami.Page {
                     implicitWidth: Kirigami.Units.gridUnit * 6
                 }
                 QQC2.ToolButton {
+                    visible: pp.isVideo && !!info.yt && pp.queueIndex >= 0
+                    icon.name: "view-media-playlist"
+                    text: "Playlist  " + (pp.queueIndex + 1) + " / " + ((pp.queueData.videos || []).length)
+                    checkable: true
+                    checked: pp.listOpen
+                    onClicked: youtube.setQueueOpen(checked)
+                    QQC2.ToolTip.text: "The rest of this playlist (Q)"
+                    QQC2.ToolTip.visible: hovered
+                }
+                QQC2.ToolButton {
                     visible: pp.isVideo && !!info.yt
                     text: "Info"
                     checkable: true
@@ -1233,6 +1253,85 @@ Kirigami.Page {
         height: subBadgeLabel.implicitHeight + 8
         Text { id: subBadgeLabel; anchors.centerIn: parent; width: parent.width - 16; color: "white"; font.pixelSize: 12
                elide: Text.ElideRight; horizontalAlignment: Text.AlignHCenter; text: pp.subBadge }
+    }
+    // YouTube: the playlist being played, in a panel on the right of the picture; click a video to jump to it
+    Rectangle {
+        id: listPanel
+        visible: pp.listOpen && pp.isVideo && pp.queueIndex >= 0
+        anchors { top: parent.top; right: parent.right; bottom: parent.bottom }
+        anchors.bottomMargin: pp.fs ? 0 : controls.height
+        width: Math.min(Kirigami.Units.gridUnit * 24, pp.width * (pp.wideLayout ? 0.36 : 0.85))
+        z: 30
+        color: "#ee101218"
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+        onVisibleChanged: if (visible) Qt.callLater(function () { queueList.positionViewAtIndex(Math.max(0, pp.queueIndex), ListView.Center) })
+        Connections { target: pp; function onQueueIndexChanged() { if (listPanel.visible) queueList.positionViewAtIndex(Math.max(0, pp.queueIndex), ListView.Center) } }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.smallSpacing
+            spacing: Kirigami.Units.smallSpacing
+            RowLayout {
+                Layout.fillWidth: true
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                        Layout.fillWidth: true; Layout.leftMargin: 6
+                        text: pp.queueData.title || "Playlist"; color: "white"; font.pixelSize: 15; font.weight: Font.Bold
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        Layout.fillWidth: true; Layout.leftMargin: 6
+                        text: "Playing " + (pp.queueIndex + 1) + " of " + ((pp.queueData.videos || []).length)
+                        color: "#b0ffffff"; font.pixelSize: 12
+                    }
+                }
+                QQC2.ToolButton { icon.name: "window-close"; display: QQC2.AbstractButton.IconOnly; text: "Close"; onClicked: youtube.setQueueOpen(false) }
+            }
+            ListView {
+                id: queueList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumHeight: 0
+                clip: true
+                model: pp.queueData.videos || []
+                boundsBehavior: Flickable.StopAtBounds
+                QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+                delegate: QQC2.ItemDelegate {
+                    id: qrow
+                    required property var modelData
+                    required property int index
+                    readonly property bool current: index === pp.queueIndex
+                    width: ListView.view.width
+                    height: Kirigami.Units.gridUnit * 4.6
+                    highlighted: current
+                    onClicked: if (!current) youtube.play(modelData.id)
+                    background: Rectangle { color: qrow.current ? "#33ffffff" : (qrow.hovered ? "#18ffffff" : "transparent"); radius: 4 }
+                    contentItem: RowLayout {
+                        spacing: Kirigami.Units.smallSpacing
+                        Text { Layout.preferredWidth: Kirigami.Units.gridUnit * 1.4; horizontalAlignment: Text.AlignHCenter; text: qrow.current ? "▶" : String(qrow.index + 1); color: qrow.current ? "#ff8080" : "#90ffffff"; font.pixelSize: 12 }
+                        Rectangle {
+                            Layout.preferredWidth: Kirigami.Units.gridUnit * 6
+                            Layout.preferredHeight: Kirigami.Units.gridUnit * 6 * 9 / 16
+                            color: "#22ffffff"; radius: 3; clip: true
+                            Image { anchors.fill: parent; source: qrow.modelData.thumb; fillMode: Image.PreserveAspectCrop; asynchronous: true; sourceSize.width: 240; visible: status === Image.Ready }
+                            Rectangle {
+                                visible: !!qrow.modelData.durText
+                                anchors { right: parent.right; bottom: parent.bottom; margins: 3 }
+                                width: qdur.implicitWidth + 8; height: qdur.implicitHeight + 2; radius: 3; color: "#cc000000"
+                                Text { id: qdur; anchors.centerIn: parent; text: qrow.modelData.durText || ""; color: "white"; font.pixelSize: 10 }
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Text { Layout.fillWidth: true; text: qrow.modelData.title; color: "white"; font.pixelSize: 13; font.weight: qrow.current ? Font.Bold : Font.Normal; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight }
+                            Text { Layout.fillWidth: true; visible: !!qrow.modelData.channel; text: qrow.modelData.channel || ""; color: "#b0ffffff"; font.pixelSize: 11; elide: Text.ElideRight }
+                        }
+                    }
+                }
+            }
+        }
     }
     // YouTube: description, chapters and comments, in a panel on the right of the picture
     Rectangle {
