@@ -20,6 +20,7 @@ Kirigami.Page {
     readonly property bool setup: !twitch.signedIn
 
     function watch(text) {
+        vodMode = false; startingVod = false
         nudges = 0
         stillFor = 0
         lastPos = -1
@@ -33,6 +34,7 @@ Kirigami.Page {
         twitch.play(text)
     }
     function leave() {
+        vodMode = false; startingVod = false
         reconnects = 0
         player.stop()
         player.source = ""
@@ -50,15 +52,34 @@ Kirigami.Page {
     readonly property bool mediaIsPlaying: player.playbackState === MediaPlayer.PlayingState
     readonly property string mediaTitle: twitch.channel
     readonly property string mediaSub: (twitch.stream && twitch.stream.title) || "Twitch"
-    function mediaToggle() { if (player.playbackState === MediaPlayer.PlayingState) player.pause(); else player.play() }
+    function mediaToggle() { togglePlay() }
     function mediaPause() { player.pause() }
-    function jumpLive() { if (dvr.alive) openMain(0); else watch(twitch.channel) }
+    function jumpLive() { if (offline) return; vodMode = false; if (dvr.alive) openMain(0); else watch(twitch.channel) }
 
     // ---- pause / rewind / Live (the channel is kept on disk while you watch) ----
     property var dvr: ({ alive: false })
+    readonly property bool offline: !!dvr.alive && !!dvr.ended                  // the channel has gone offline; what was recorded can still be played
+    readonly property bool atEnd: offline && player.mediaStatus === MediaPlayer.EndOfMedia
+    function togglePlay() {
+        if (atEnd) { openMain(sliderTo); return }                              // played to the end: start again from the beginning of the recording
+        if (player.playbackState === MediaPlayer.PlayingState) player.pause(); else player.play()
+    }
     property real partStart: 0                      // stream time at which the playlist now playing began (the channel's floor, or the break's start)
     property bool scrubbing: false
     readonly property real behind: dvr.alive ? Math.max(0, dvr.live - (partStart + player.position / 1000)) : 0
+    // Going back past what was recorded: Twitch keeps a saved copy of the broadcast that begins where the stream began.
+    property bool vodMode: false                    // playing the saved copy rather than the live recording
+    property real vodOffset: 0                      // seconds into the saved copy where the playlist now playing began
+    property real vodTotal: 0                       // how long the saved copy was when it was opened
+    property bool startingVod: false
+    readonly property real sliderTo: vodMode ? Math.max(1, vodTotal) : Math.max(1, dvr.live - dvr.oldest)
+    readonly property real sliderAt: vodMode ? Math.min(sliderTo, vodOffset + player.position / 1000) : Math.max(0, sliderTo - behind)
+    readonly property bool awayFromLive: vodMode || behind > 10
+    function seekTo(v) {
+        if (vodMode) { twitch.vodOpen(v); return }
+        var back = sliderTo - v
+        openMain(back < 8 ? 0 : back)
+    }
     function syncPart() {
         var st = twitch.dvrStatus()
         dvr = st
@@ -67,6 +88,7 @@ Kirigami.Page {
     // play the channel from `back` seconds behind live (0 = live); a break that falls there plays first
     function openMain(back) {
         stillFor = 0; lastPos = -1; posMoved = false; ticks = 0; nudges = 0
+        vodMode = false
         player.stop()
         inAd = twitch.seekBack(back)
         opens++
@@ -77,7 +99,11 @@ Kirigami.Page {
     }
     Timer {
         interval: 1000; repeat: true; running: pg.phase === "playing"
-        onTriggered: if (!pg.scrubbing) pg.dvr = twitch.dvrStatus()
+        onTriggered: if (!pg.scrubbing) {
+            var was = pg.offline
+            pg.dvr = twitch.dvrStatus()
+            if (!was && pg.offline) applicationWindow().showPassiveNotification("This channel went offline. You can still replay what was recorded.")
+        }
     }
     function fmtLen(s) {
         s = Math.max(0, Math.round(s))
@@ -92,6 +118,23 @@ Kirigami.Page {
 
     Connections {
         target: twitch
+        function onVodReady(url, offset, total) {
+            pg.startingVod = false
+            pg.stillFor = 0; pg.lastPos = -1; pg.posMoved = false; pg.ticks = 0; pg.nudges = 0
+            player.stop()
+            pg.inAd = false
+            pg.vodMode = true
+            pg.vodOffset = offset
+            pg.vodTotal = total
+            pg.opens++
+            console.log("marquee: twitch: opening the saved broadcast at " + Math.round(offset) + "s of " + Math.round(total) + "s")
+            player.source = url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + pg.opens
+            player.play()
+        }
+        function onVodFailed(message) {
+            pg.startingVod = false
+            applicationWindow().showPassiveNotification(message)
+        }
         function onStreamReady(login) {
             if (pg.phase !== "loading") return
             pg.inAd = !!twitch.stream.startsInAd
@@ -114,7 +157,7 @@ Kirigami.Page {
         }
         onMediaStatusChanged: {
             console.log("marquee: twitch: player status " + mediaStatus + ", video " + hasVideo + ", audio " + hasAudio)
-            if (mediaStatus === MediaPlayer.EndOfMedia && pg.phase === "playing" && (pg.inAd || twitch.adPending())) {
+            if (mediaStatus === MediaPlayer.EndOfMedia && pg.phase === "playing" && !pg.vodMode && (pg.inAd || twitch.adPending())) {
                 // the channel has reached a commercial break (play it in full), or the break is over (back to the channel)
                 pg.stillFor = 0; pg.lastPos = -1; pg.posMoved = false; pg.ticks = 0; pg.nudges = 0
                 player.stop()
@@ -135,6 +178,14 @@ Kirigami.Page {
                 player.play()
                 return
             }
+            if (mediaStatus === MediaPlayer.EndOfMedia && pg.phase === "playing" && !pg.vodMode) {
+                pg.dvr = twitch.dvrStatus()
+                if (pg.dvr.alive && pg.dvr.ended) {
+                    // the channel went offline: what was recorded is still here to replay and scrub through
+                    console.log("marquee: twitch: the channel is offline; the recording stays so it can be replayed")
+                    return
+                }
+            }
             if ((mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia) && pg.phase === "playing")
                 pg.reconnect("the stream ended")
         }
@@ -145,7 +196,7 @@ Kirigami.Page {
             else if (playbackState === MediaPlayer.PlayingState && pg.pausedAt > 0) {
                 var longPause = Date.now() - pg.pausedAt > 15000
                 pg.pausedAt = 0
-                if (longPause && pg.phase === "playing" && !pg.dvr.alive) { console.log("marquee: twitch: resumed after a pause; going back to live"); Qt.callLater(function () { pg.watch(twitch.channel) }) }
+                if (longPause && pg.phase === "playing" && !pg.dvr.alive && !pg.vodMode) { console.log("marquee: twitch: resumed after a pause; going back to live"); Qt.callLater(function () { pg.watch(twitch.channel) }) }
             }
         }
     }
@@ -205,7 +256,10 @@ Kirigami.Page {
         posMoved = false
         ticks = 0
         twitch.probe(why)
-        if (reconnects <= 3 && twitch.stream.url && dvr.alive) {
+        if (vodMode && reconnects <= 3) {
+            console.log("marquee: twitch: " + why + "; reopening the saved broadcast where it was (" + reconnects + ")")
+            twitch.vodOpen(vodOffset + player.position / 1000)
+        } else if (reconnects <= 3 && twitch.stream.url && dvr.alive) {
             console.log("marquee: twitch: " + why + "; reopening where it was (" + reconnects + ")")
             openMain(behind < 6 ? 0 : behind)
         } else if (reconnects <= 3 && twitch.stream.url) {
@@ -288,36 +342,46 @@ Kirigami.Page {
                 spacing: Kirigami.Units.smallSpacing
                 RowLayout {
                     spacing: Kirigami.Units.largeSpacing
-                    visible: pg.dvr.alive && pg.dvr.live - pg.dvr.oldest > 6
-                    QQC2.Label { text: pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : "Live") }
+                    visible: pg.vodMode || (pg.dvr.alive && pg.dvr.live - pg.dvr.oldest > 6)
+                    QQC2.Label {
+                        text: pg.vodMode ? pg.fmtLen(pg.scrubbing ? rewSlider.value : pg.sliderAt)
+                                         : (pg.scrubbing ? pg.fmtBehind(rewSlider.to - rewSlider.value) : (pg.behind > 10 ? pg.fmtBehind(pg.behind) : (pg.offline ? "End" : "Live")))
+                    }
                     QQC2.Slider {
                         id: rewSlider
                         Layout.fillWidth: true
                         from: 0
-                        to: Math.max(1, pg.dvr.live - pg.dvr.oldest)
+                        to: pg.sliderTo
                         // The handle follows the picture, except while you hold it. A click or drag that really moved it rewinds to there;
                         // letting go without having moved it does nothing.
-                        function follow() { if (!pressed && !pg.scrubbing) value = Math.max(0, to - pg.behind) }
+                        function follow() { if (!pressed && !pg.scrubbing) value = pg.sliderAt }
                         Component.onCompleted: follow()
                         onToChanged: follow()
-                        Connections { target: pg; function onBehindChanged() { rewSlider.follow() } }
+                        Connections { target: pg; function onSliderAtChanged() { rewSlider.follow() } }
                         onPressedChanged: {
                             if (pressed) {
                                 pg.scrubbing = true
                             } else if (pg.scrubbing) {
-                                var back = to - value
-                                var now = pg.behind
+                                var now = pg.sliderAt
                                 pg.scrubbing = false
-                                if (Math.abs(back - now) > 3) {
-                                    console.log("marquee: twitch: slider released at " + Math.round(back) + "s behind (was " + Math.round(now) + "s)")
-                                    pg.openMain(back < 8 ? 0 : back)
+                                if (Math.abs(value - now) > 3) {
+                                    console.log("marquee: twitch: slider released at " + Math.round(value) + " of " + Math.round(to) + " (was " + Math.round(now) + ")")
+                                    pg.seekTo(value)
                                 } else follow()
                             }
                         }
-                        QQC2.ToolTip.text: pg.fmtBehind(rewSlider.to - rewSlider.value)
+                        QQC2.ToolTip.text: pg.vodMode ? pg.fmtLen(rewSlider.value) : pg.fmtBehind(rewSlider.to - rewSlider.value)
                         QQC2.ToolTip.visible: pressed
                     }
-                    QQC2.Label { text: pg.fmtLen(pg.dvr.live - pg.dvr.oldest) + " recorded" }
+                    QQC2.Label { text: pg.vodMode ? pg.fmtLen(pg.vodTotal) + " saved" : pg.fmtLen(pg.dvr.live - pg.dvr.oldest) + (pg.offline ? " recorded · offline" : " recorded") }
+                    QQC2.ToolButton {
+                        visible: !pg.vodMode && twitch.vodAvailable
+                        enabled: !pg.startingVod
+                        text: pg.startingVod ? "Fetching…" : "⏮ From the start"
+                        onClicked: { pg.startingVod = true; twitch.vodOpen(0) }
+                        QQC2.ToolTip.text: "Go back to where this broadcast began, using the saved copy Twitch keeps of it"
+                        QQC2.ToolTip.visible: hovered
+                    }
                 }
                 RowLayout {
                     spacing: Kirigami.Units.smallSpacing
@@ -325,14 +389,15 @@ Kirigami.Page {
                         icon.name: player.playbackState === MediaPlayer.PlayingState ? "media-playback-pause" : "media-playback-start"
                         display: QQC2.AbstractButton.IconOnly
                         text: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
-                        onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
+                        onClicked: pg.togglePlay()
                     }
                     Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
-                        text: "● Live"
-                        highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
-                        onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
-                        QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
+                        text: pg.offline ? "Offline" : "● Live"
+                        enabled: !pg.offline
+                        highlighted: !pg.offline && (player.playbackState !== MediaPlayer.PlayingState || pg.awayFromLive)
+                        onClicked: pg.jumpLive()
+                        QQC2.ToolTip.text: pg.offline ? "This channel has gone offline" : "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
                     }
                     QQC2.ComboBox {
                         id: qBox

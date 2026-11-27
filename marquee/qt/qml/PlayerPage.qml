@@ -33,6 +33,14 @@ Kirigami.Page {
     // A live YouTube stream is recorded while it plays (see core/streamproxy.py Dvr), so it can be paused, rewound and sent back to live.
     property var dvr: ({})                          // {oldest, live, viewerStart, alive}: seconds from the start of the recording
     property int dvrOpens: 0
+    // "From the start": the live stream played from an earlier point in what YouTube still lists, nothing recorded
+    property bool histMode: false
+    property real histOffset: 0                     // seconds into that stretch where the picture now playing began
+    property real histTotal: 0                      // how long that stretch is
+    readonly property real histAt: Math.min(histTotal, histOffset + videoPlayer.position / 1000)
+    property bool startingOver: false
+    property bool freezing: false                   // the last picture is held on screen while a new position loads
+    property bool dvrScrub: false                   // the rewind bar's handle is held
     readonly property bool dvrOn: !!info.isLive && !!info.dvr && !!dvr.alive
     // how far behind the live edge the picture is, in seconds
     readonly property real behind: dvrOn ? Math.max(0, dvr.live - (dvr.viewerStart + videoPlayer.position / 1000)) : 0
@@ -61,6 +69,15 @@ Kirigami.Page {
         console.log("marquee: captions: page opened for " + info.id + "; controller has " + youtube.captionVideo + " / " + youtube.captionTrack)
         if (!info.yt || !info.id || youtube.captionVideo !== info.id.substring(3)) youtube.clearCaption()
     }
+    readonly property bool listOpen: youtube.queueOpen      // the playlist beside the picture (kept in the controller: this page is rebuilt now and then)
+    readonly property var queueData: youtube.queue
+    readonly property int queueIndex: {
+        var vs = (queueData && queueData.videos) || []
+        for (var i = 0; i < vs.length; i++) if (!!info.id && "yt:" + vs[i].id === info.id) return i
+        return -1
+    }
+    onListOpenChanged: if (listOpen) infoOpen = false
+    onInfoOpenChanged: if (infoOpen && listOpen) youtube.setQueueOpen(false)
     property bool infoOpen: false                  // the side panel with a YouTube video's description, chapters and comments
     property int infoTab: 0
     function seekTo(seconds) { if (pp.player && !pp.isLive) pp.player.position = seconds * 1000 }
@@ -239,15 +256,32 @@ Kirigami.Page {
     // join the recording `back` seconds behind live (0 = the live edge) without asking YouTube for anything new
     function attach(back) {
         pausedAt = 0; liveStill = 0; liveLast = -1
-        videoPlayer.source = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
-        videoPlayer.play()
+        var url = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
+        swapSource(url)
+    }
+    // Switch to another stretch of the same stream without a black flash: the picture now showing is kept as a still
+    // until the new one has moved, like a seek in an ordinary video.
+    function swapSource(url) {
+        function go() {
+            videoPlayer.source = url
+            videoPlayer.play()
+        }
+        if (!video.visible || video.width < 2 || videoPlayer.playbackState === MediaPlayer.StoppedState) { go(); return }
+        video.grabToImage(function (r) {
+            stillFrame.source = r.url
+            freezing = true
+            freezeTimeout.restart()
+            go()
+        })
     }
     function nudge(seconds) {                          // seconds > 0 goes forward
-        if (dvrOn) attach(Math.max(0, behind - seconds))
+        if (histMode) youtube.historyOpen(info.id.substring(3), Math.max(0, Math.min(histTotal, histAt + seconds)))
+        else if (dvrOn) attach(Math.max(0, behind - seconds))
         else player.position = Math.max(0, Math.min(player.duration, player.position + seconds * 1000))
     }
     function goLive(full) {
         if (!info.isLive) return
+        if (histMode) { histMode = false; startingOver = false; full = true; dvr = ({}) }       // leave the earlier part: a fresh start at the live edge
         if (!full && dvrOn) { attach(0); return }
         pausedAt = 0; liveStill = 0; liveLast = -1
         // ask YouTube for a fresh address every time: reloading the old one can be refused (HTTP 403) and then nothing plays
@@ -458,7 +492,7 @@ Kirigami.Page {
             else if (playbackState === MediaPlayer.PlayingState && pp.pausedAt > 0) {
                 var longPause = Date.now() - pp.pausedAt > 15000
                 pp.pausedAt = 0
-                if (longPause && !pp.dvrOn) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(function () { pp.goLive(true) }) }
+                if (longPause && !pp.dvrOn && !pp.histMode) { console.log("marquee: youtube: resumed a live stream after a pause; going back to live"); Qt.callLater(function () { pp.goLive(true) }) }
             }
         }
         onMediaStatusChanged: {
@@ -511,7 +545,7 @@ Kirigami.Page {
     Timer {
         interval: 3000
         repeat: true
-        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && videoPlayer.playbackState === MediaPlayer.PlayingState
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !pp.histMode && videoPlayer.playbackState === MediaPlayer.PlayingState
         onTriggered: {
             var p = videoPlayer.position
             if (p === pp.liveLast) pp.liveStill++
@@ -529,7 +563,7 @@ Kirigami.Page {
         interval: 1000
         repeat: true
         triggeredOnStart: true
-        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !!pp.info.dvr
+        running: pp.isVideo && !!pp.info.yt && !!pp.info.isLive && !!pp.info.dvr && !pp.histMode
         onTriggered: pp.dvr = youtube.dvrStatus(pp.info.id.substring(3))
     }
     Shortcut { sequences: ["Up", "PgUp"]; enabled: pp.isLive; onActivated: pp.step(1) }
@@ -544,7 +578,8 @@ Kirigami.Page {
     Shortcut { sequences: ["N"]; onActivated: pp.step(1) }
     Shortcut { sequences: ["P"]; onActivated: pp.step(-1) }
     Shortcut { sequences: ["F", "F11"]; onActivated: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
-    Shortcut { sequences: ["Escape"]; onActivated: pp.infoOpen ? pp.infoOpen = false : pp.leave() }
+    Shortcut { sequences: ["Escape"]; onActivated: pp.listOpen ? youtube.setQueueOpen(false) : (pp.infoOpen ? pp.infoOpen = false : pp.leave()) }
+    Shortcut { sequences: ["Q"]; enabled: pp.isVideo && pp.queueIndex >= 0; onActivated: youtube.setQueueOpen(!pp.listOpen) }
     Shortcut { sequences: ["I"]; enabled: pp.isVideo && !!pp.info.yt; onActivated: pp.infoOpen = !pp.infoOpen }
 
     Rectangle {
@@ -641,6 +676,19 @@ Kirigami.Page {
             visible: pp.isVideo && !pp.isLive
             fillMode: VideoOutput.PreserveAspectFit
             TapHandler { onTapped: pp.toggle(); onDoubleTapped: applicationWindow().visibility === Window.FullScreen ? applicationWindow().showNormal() : applicationWindow().showFullScreen() }
+        }
+        Image {                                          // the held picture while a new position loads
+            id: stillFrame
+            anchors.fill: parent
+            visible: pp.freezing && source != ""
+            fillMode: Image.PreserveAspectFit
+            cache: false
+            z: 1
+            Timer { id: freezeTimeout; interval: 12000; onTriggered: pp.freezing = false }
+            Connections {
+                target: videoPlayer
+                function onPositionChanged() { if (pp.freezing && videoPlayer.position > 400 && videoPlayer.playbackState === MediaPlayer.PlayingState) pp.freezing = false }
+            }
         }
 
         // Subtitles sit on the picture, so they use fixed light-on-dark colours rather than the desktop theme.
@@ -831,23 +879,47 @@ Kirigami.Page {
             // a recorded live stream: drag back to an earlier moment, or press Live to return to the edge
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
-                visible: pp.dvrOn && pp.dvr.live - pp.dvr.oldest > 6
-                QQC2.Label { text: pp.behind > 4 ? "-" + pp.fmt(pp.behind) : "Live" }
+                visible: pp.histMode || (pp.dvrOn && pp.dvr.live - pp.dvr.oldest > 6)
+                QQC2.Label { text: pp.histMode ? pp.fmt(pp.histAt) : (pp.behind > 4 ? "-" + pp.fmt(pp.behind) : "Live") }
                 QQC2.Slider {
                     id: dvrSeek
                     Layout.fillWidth: true
-                    from: pp.dvr.oldest || 0
-                    to: Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
-                    onPressedChanged: if (!pressed) pp.attach(Math.max(0, pp.dvr.live - value))
-                    Binding { target: dvrSeek; property: "value"; value: Math.min(dvrSeek.to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000); when: !dvrSeek.pressed }
-                    QQC2.ToolTip.text: "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
+                    from: pp.histMode ? 0 : (pp.dvr.oldest || 0)
+                    to: pp.histMode ? Math.max(1, pp.histTotal) : Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
+                    // the handle follows the picture except while held; only a handle that was really moved rewinds
+                    function at() { return pp.histMode ? pp.histAt : Math.min(to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000) }
+                    function follow() { if (!pressed && !pp.dvrScrub) value = at() }
+                    Component.onCompleted: follow()
+                    onToChanged: follow()
+                    onFromChanged: follow()
+                    Connections { target: videoPlayer; function onPositionChanged() { dvrSeek.follow() } }
+                    onPressedChanged: {
+                        if (pressed) pp.dvrScrub = true
+                        else if (pp.dvrScrub) {
+                            var now = at()
+                            pp.dvrScrub = false
+                            if (Math.abs(value - now) > 3) {
+                                if (pp.histMode) youtube.historyOpen(pp.info.id.substring(3), value)
+                                else pp.attach(Math.max(0, pp.dvr.live - value))
+                            } else follow()
+                        }
+                    }
+                    QQC2.ToolTip.text: pp.histMode ? pp.fmt(value) : "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
                     QQC2.ToolTip.visible: pressed
                 }
-                QQC2.Label { text: pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
+                QQC2.Label { text: pp.histMode ? pp.fmt(pp.histTotal) : pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
+                QQC2.ToolButton {
+                    text: pp.startingOver ? "Fetching…" : "⏮ From the start"
+                    enabled: !pp.startingOver
+                    visible: !pp.histMode
+                    onClicked: { pp.startingOver = true; youtube.historyOpen(pp.info.id.substring(3), 0) }
+                    QQC2.ToolTip.text: "Go back to where the broadcast began, as far as YouTube keeps it"
+                    QQC2.ToolTip.visible: hovered
+                }
             }
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
-                visible: !pp.isLive && !pp.dvrOn
+                visible: !pp.isLive && !pp.dvrOn && !pp.histMode
                 QQC2.Label { text: pp.fmt(player.position) }
                 QQC2.Slider {
                     id: seek
@@ -940,6 +1012,16 @@ Kirigami.Page {
                     implicitWidth: Kirigami.Units.gridUnit * 6
                 }
                 QQC2.ToolButton {
+                    visible: pp.isVideo && !!info.yt && pp.queueIndex >= 0
+                    icon.name: "view-media-playlist"
+                    text: "Playlist  " + (pp.queueIndex + 1) + " / " + ((pp.queueData.videos || []).length)
+                    checkable: true
+                    checked: pp.listOpen
+                    onClicked: youtube.setQueueOpen(checked)
+                    QQC2.ToolTip.text: "The rest of this playlist (Q)"
+                    QQC2.ToolTip.visible: hovered
+                }
+                QQC2.ToolButton {
                     visible: pp.isVideo && !!info.yt
                     text: "Info"
                     checkable: true
@@ -1002,7 +1084,7 @@ Kirigami.Page {
                 QQC2.ToolButton {
                     visible: pp.isVideo && !!info.yt && !!info.isLive
                     text: "● Live"
-                    highlighted: pp.dvrOn ? pp.behind > 4 : videoPlayer.playbackState !== MediaPlayer.PlayingState
+                    highlighted: pp.histMode || (pp.dvrOn ? pp.behind > 4 : videoPlayer.playbackState !== MediaPlayer.PlayingState)
                     onClicked: pp.goLive(false)
                     QQC2.ToolTip.text: pp.dvrOn ? "Jump to the live edge of the broadcast" : "Jump back to the live broadcast"
                     QQC2.ToolTip.visible: hovered
@@ -1120,6 +1202,26 @@ Kirigami.Page {
             Text { Layout.alignment: Qt.AlignHCenter; visible: youtube.note !== ""; text: "Downloading " + youtube.note; color: "#ccffffff"; font.pixelSize: 13 }
         }
     }
+    Connections {
+        target: youtube
+        function onHistoryReady(vid, url, offset, total) {
+            if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
+            var first = !pp.histMode
+            pp.startingOver = false
+            pp.liveStill = 0; pp.liveLast = -1; pp.pausedAt = 0
+            pp.histMode = true
+            pp.histOffset = offset
+            pp.histTotal = total
+            pp.dvr = ({})
+            pp.swapSource(url + (url.indexOf("?") >= 0 ? "&" : "?") + "n=" + (++pp.dvrOpens))
+            if (first) applicationWindow().showPassiveNotification("Going back " + Math.round(total / 60) + " minutes, to where this stream began. Press Live to return.")
+        }
+        function onHistoryFailed(vid, message) {
+            if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
+            pp.startingOver = false
+            applicationWindow().showPassiveNotification(message)
+        }
+    }
     // YouTube started at 360p so it opened quickly; the bigger picture downloads behind it and replaces it when ready
     Connections {
         target: youtube
@@ -1151,6 +1253,85 @@ Kirigami.Page {
         height: subBadgeLabel.implicitHeight + 8
         Text { id: subBadgeLabel; anchors.centerIn: parent; width: parent.width - 16; color: "white"; font.pixelSize: 12
                elide: Text.ElideRight; horizontalAlignment: Text.AlignHCenter; text: pp.subBadge }
+    }
+    // YouTube: the playlist being played, in a panel on the right of the picture; click a video to jump to it
+    Rectangle {
+        id: listPanel
+        visible: pp.listOpen && pp.isVideo && pp.queueIndex >= 0
+        anchors { top: parent.top; right: parent.right; bottom: parent.bottom }
+        anchors.bottomMargin: pp.fs ? 0 : controls.height
+        width: Math.min(Kirigami.Units.gridUnit * 24, pp.width * (pp.wideLayout ? 0.36 : 0.85))
+        z: 30
+        color: "#ee101218"
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+        onVisibleChanged: if (visible) Qt.callLater(function () { queueList.positionViewAtIndex(Math.max(0, pp.queueIndex), ListView.Center) })
+        Connections { target: pp; function onQueueIndexChanged() { if (listPanel.visible) queueList.positionViewAtIndex(Math.max(0, pp.queueIndex), ListView.Center) } }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.smallSpacing
+            spacing: Kirigami.Units.smallSpacing
+            RowLayout {
+                Layout.fillWidth: true
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                        Layout.fillWidth: true; Layout.leftMargin: 6
+                        text: pp.queueData.title || "Playlist"; color: "white"; font.pixelSize: 15; font.weight: Font.Bold
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        Layout.fillWidth: true; Layout.leftMargin: 6
+                        text: "Playing " + (pp.queueIndex + 1) + " of " + ((pp.queueData.videos || []).length)
+                        color: "#b0ffffff"; font.pixelSize: 12
+                    }
+                }
+                QQC2.ToolButton { icon.name: "window-close"; display: QQC2.AbstractButton.IconOnly; text: "Close"; onClicked: youtube.setQueueOpen(false) }
+            }
+            ListView {
+                id: queueList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumHeight: 0
+                clip: true
+                model: pp.queueData.videos || []
+                boundsBehavior: Flickable.StopAtBounds
+                QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+                delegate: QQC2.ItemDelegate {
+                    id: qrow
+                    required property var modelData
+                    required property int index
+                    readonly property bool current: index === pp.queueIndex
+                    width: ListView.view.width
+                    height: Kirigami.Units.gridUnit * 4.6
+                    highlighted: current
+                    onClicked: if (!current) youtube.play(modelData.id)
+                    background: Rectangle { color: qrow.current ? "#33ffffff" : (qrow.hovered ? "#18ffffff" : "transparent"); radius: 4 }
+                    contentItem: RowLayout {
+                        spacing: Kirigami.Units.smallSpacing
+                        Text { Layout.preferredWidth: Kirigami.Units.gridUnit * 1.4; horizontalAlignment: Text.AlignHCenter; text: qrow.current ? "▶" : String(qrow.index + 1); color: qrow.current ? "#ff8080" : "#90ffffff"; font.pixelSize: 12 }
+                        Rectangle {
+                            Layout.preferredWidth: Kirigami.Units.gridUnit * 6
+                            Layout.preferredHeight: Kirigami.Units.gridUnit * 6 * 9 / 16
+                            color: "#22ffffff"; radius: 3; clip: true
+                            Image { anchors.fill: parent; source: qrow.modelData.thumb; fillMode: Image.PreserveAspectCrop; asynchronous: true; sourceSize.width: 240; visible: status === Image.Ready }
+                            Rectangle {
+                                visible: !!qrow.modelData.durText
+                                anchors { right: parent.right; bottom: parent.bottom; margins: 3 }
+                                width: qdur.implicitWidth + 8; height: qdur.implicitHeight + 2; radius: 3; color: "#cc000000"
+                                Text { id: qdur; anchors.centerIn: parent; text: qrow.modelData.durText || ""; color: "white"; font.pixelSize: 10 }
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Text { Layout.fillWidth: true; text: qrow.modelData.title; color: "white"; font.pixelSize: 13; font.weight: qrow.current ? Font.Bold : Font.Normal; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight }
+                            Text { Layout.fillWidth: true; visible: !!qrow.modelData.channel; text: qrow.modelData.channel || ""; color: "#b0ffffff"; font.pixelSize: 11; elide: Text.ElideRight }
+                        }
+                    }
+                }
+            }
+        }
     }
     // YouTube: description, chapters and comments, in a panel on the right of the picture
     Rectangle {

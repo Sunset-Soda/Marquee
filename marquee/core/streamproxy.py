@@ -6,6 +6,7 @@ with the right headers, passing Range requests through so seeking works.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -236,6 +237,35 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):                            # the player closed the connection
             pass
 
+    def _serve_vod(self, head: bool, url: str, headers: dict):
+        """A saved Twitch broadcast's playlist, cut to start `from` seconds in (see core.twitch.cut_vod); its pieces are fetched from Twitch directly."""
+        from urllib.parse import parse_qs, urlsplit
+        from . import twitch
+        try:
+            start = float(parse_qs(urlsplit(self.path).query).get("from", ["0"])[0])
+        except ValueError:
+            start = 0.0
+        try:
+            h = {"User-Agent": twitch.UA, **{k: v for k, v in (headers or {}).items() if k.lower() != "range"}}
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=15) as r:
+                text = r.read(8_000_000).decode("utf-8", "replace")
+            body, total = twitch.cut_vod(text, url, start)
+        except Exception:
+            self.send_error(502)
+            return
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Total-Seconds", f"{total:.1f}")
+        self.end_headers()
+        if not head:
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+
     def _serve_hls(self, head: bool, url: str, part: str, state):
         """The channel ("main") or the commercial break ("ad") of a live playlist, read fresh each time the player asks (see core.twitch.AdState)."""
         import sys
@@ -300,6 +330,39 @@ class _Handler(BaseHTTPRequestHandler):
         head = [re.sub(r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)", lambda m: m.group(1) + str(int(m.group(2)) + dropped), l) for l in head]
         kept = [l for g in groups[dropped:] for l in g]
         return head + kept
+
+    @staticmethod
+    def _from_offset(lines: list, start: float, hold: int = 2) -> tuple:
+        """The same playlist, but starting `start` seconds after its first piece (every piece YouTube still lists is kept, minus the
+        newest `hold`, which it is not serving yet). Returns (lines, seconds the playlist covers). Lets a viewer begin anywhere in the past."""
+        first = next((i for i, l in enumerate(lines) if l.startswith("#EXTINF")), None)
+        if first is None:
+            return lines, 0.0
+        head, body = lines[:first], lines[first:]
+        groups, cur = [], []
+        for l in body:
+            cur.append(l)
+            if l.strip() and not l.startswith("#"):
+                groups.append(cur)
+                cur = []
+        if hold and len(groups) > hold:
+            groups = groups[:len(groups) - hold]
+
+        def length(g):
+            for l in g:
+                if l.startswith("#EXTINF:"):
+                    try:
+                        return float(l[8:].split(",")[0])
+                    except ValueError:
+                        pass
+            return 0.0
+        total = sum(length(g) for g in groups)
+        t, dropped = 0.0, 0
+        while dropped < len(groups) - 1 and t + length(groups[dropped]) <= start:
+            t += length(groups[dropped])
+            dropped += 1
+        head = [re.sub(r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)", lambda m: m.group(1) + str(int(m.group(2)) + dropped), l) for l in head]
+        return head + [l for g in groups[dropped:] for l in g], total
 
     def _maybe_refresh_live(self, token: str):
         st = getattr(self.server, "live_refresh", {}).get(token)
@@ -387,7 +450,14 @@ class _Handler(BaseHTTPRequestHandler):
                         line = local(line.strip(), "index.m3u8" if was_variant else "seg.ts")
                         was_variant = False
                     out.append(line)
-                out = self._live_edge(out)
+                total_s = 0.0
+                if q.get("from") and not q.get("u"):                 # a viewer of the past: this playlist begins that many seconds in
+                    try:
+                        out, total_s = self._from_offset(out, float(q["from"][0]))
+                    except ValueError:
+                        out = self._live_edge(out)
+                else:
+                    out = self._live_edge(out)
                 nums = [int(x) for x in re.findall(r"%2Fsq%2F(\d+)%2F", "\n".join(out))]
                 if nums and getattr(self.server, "_live_seen", None) != (nums[0], nums[-1]):
                     self.server._live_seen = (nums[0], nums[-1])              # type: ignore[attr-defined]
@@ -398,6 +468,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/vnd.apple.mpegurl")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-cache")
+                if total_s:
+                    self.send_header("X-Total-Seconds", f"{total_s:.1f}")
                 self.end_headers()
                 if not head:
                     try:
@@ -450,6 +522,57 @@ class _Handler(BaseHTTPRequestHandler):
                     return
         threading.Thread(target=watch, daemon=True).start()
 
+    def _serve_dash(self, head: bool, src):
+        """A live stream's numbered pieces (core.dashstart): /info says how much can be played; /v.mp4 and /a.mp4?from=SECONDS stream the
+        picture and the sound from there on, following the stream as it grows."""
+        import sys
+        from urllib.parse import parse_qs, urlsplit
+        parts = urlsplit(self.path)
+        name = parts.path.strip("/").split("/")[-1]
+        try:
+            if name == "info":
+                n, seg, total = src.look()
+                body = json.dumps({"head": n, "seg": seg, "total": total}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-Total-Seconds", f"{total:.1f}")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if not head:
+                    self.wfile.write(body)
+                return
+            if name not in ("v.mp4", "a.mp4"):
+                self.send_error(404)
+                return
+            start_s = float(parse_qs(parts.query).get("from", ["0"])[0])
+            n, seg, total = src.look()
+            first = max(0, min(int(start_s / seg), max(0, n - 2)))
+        except (OSError, ValueError, RuntimeError) as e:
+            print(f"[history] pieces unavailable: {e}", file=sys.stderr, flush=True)
+            self.send_error(502)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.close_connection = True
+        if head:
+            return
+        sent = 0
+        try:
+            for data in src.pieces(name[0], first):
+                self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+                self.wfile.flush()
+                sent += len(data)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (OSError, ValueError):                             # the player closed the connection
+            pass
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[history] {name} stopped: {e}", file=sys.stderr, flush=True)
+
     def _serve_retimed(self, head: bool, source: str):
         """A live stream passed through ffmpeg (copying, not re-encoding) so the player gets one plain continuous stream whose
         clock starts at zero, instead of an HLS playlist whose pieces start hours in. Some Qt/FFmpeg versions never start the
@@ -470,12 +593,20 @@ class _Handler(BaseHTTPRequestHandler):
         if not exe:
             return
         first = []
-        m = re.match(r"http://127\.0\.0\.1:\d+/(s\d+)$", source)
+        dash = re.match(r"(http://127\.0\.0\.1:\d+/m\d+)/dash(\?.*)?$", source)
+        m = re.match(r"http://127\.0\.0\.1:\d+/([sv]\d+)(?:/index\.m3u8)?(?:\?.*)?$", source)
         ent = self.server.entries.get(m.group(1)) if m else None   # type: ignore[attr-defined]
-        if ent and ent[0] == "hls":
+        if ent and (ent[0] in ("hls", "vod") or (ent[0] == "live" and "from=" in source)):
             first = ["-live_start_index", "0", "-analyzeduration", "1500000", "-probesize", "1500000"]                    # start at the first piece listed (a rewound spot), not three from the end
-        cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *first, "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
-               "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
+        if dash:                                                  # numbered pieces: the picture and the sound arrive separately
+            q = dash.group(2) or ""
+            quick = ["-analyzeduration", "1500000", "-probesize", "1500000", "-f", "mp4"]
+            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *quick, "-i", f"{dash.group(1)}/v.mp4{q}",
+                   *quick, "-i", f"{dash.group(1)}/a.mp4{q}", "-map", "0:v:0", "-map", "1:a:0",
+                   "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
+        else:
+            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *first, "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
+                   "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         except OSError as e:
@@ -581,7 +712,8 @@ class _Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             threading.Thread(target=feed, daemon=True).start()
-            print(f"[dvr] a viewer joined {back:.0f}s behind live", file=sys.stderr, flush=True)
+            st = dvr.status()
+            print(f"[dvr] a viewer joined {min(back, st['live'] - st['oldest']):.0f}s behind live (the recording holds {st['live'] - st['oldest']:.0f}s so far)", file=sys.stderr, flush=True)
             fd = proc.stdout.fileno()
             while True:
                 data = os.read(fd, 64 * 1024)
@@ -617,6 +749,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if entry[0] == "retime":
             self._serve_retimed(head, entry[1])
+            return
+        if entry[0] == "vod":
+            self._serve_vod(head, entry[1], entry[2])
+            return
+        if entry[0] == "dash":
+            self._serve_dash(head, entry[1])
             return
         if entry[0] == "rec":
             parts = self.path.split("?")[0].strip("/").split("/")
@@ -820,6 +958,22 @@ class StreamProxy:
         m = re.search(r"/(d\d+)/live\.ts", url or "")
         d = self._server.dvrs.get(m.group(1)) if m else None      # type: ignore[attr-defined]
         return d.status() if d else None
+
+    def add_vod(self, url: str, headers: dict | None = None) -> str:
+        """The local address of a saved broadcast's playlist; add ?from=SECONDS to start that far in."""
+        s = self._start()
+        self._n += 1
+        token = f"v{self._n}"
+        s.entries[token] = ("vod", url, dict(headers or {}))        # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}/index.m3u8"
+
+    def add_dash(self, src) -> str:
+        """The local address of a live stream's numbered pieces (a core.dashstart.DashSource); see _serve_dash."""
+        s = self._start()
+        self._n += 1
+        token = f"m{self._n}"
+        s.entries[token] = ("dash", src)                           # type: ignore[attr-defined]
+        return f"http://127.0.0.1:{s.server_address[1]}/{token}"
 
     def add_rec(self, rec) -> str:
         """Serve a core.twitch.Recorder's pieces; sets rec.base to their address and returns it."""

@@ -19,6 +19,8 @@ class YoutubeController(QObject):
     _progress = Signal(str)
     imported = Signal(int, int)         # channels added, channels already subscribed
     ready = Signal(str)                 # a video's stream address is known: play "yt:<id>"
+    historyReady = Signal(str, str, float, float)   # video id, an address playing the earlier part from `offset`, how many seconds that stretch covers
+    historyFailed = Signal(str, str)
     shortReady = Signal(str)            # the same for a Short, which plays inside the Shorts page instead
     shortFailed = Signal(str, str)      # a Short's id and why it could not be opened
     _done = Signal(str, object)
@@ -48,6 +50,9 @@ class YoutubeController(QObject):
         self._pl_results: list[dict] = []
         self._playlist: dict = {}
         self._queue: list[str] = []                 # video ids that play one after another (a playlist)
+        self._queue_info: list[dict] = []           # the same videos with their titles and pictures, for the list beside the player
+        self._queue_title = ""
+        self._queue_open = False                    # the playlist panel beside the picture is showing (kept here: the player page is rebuilt now and then)
         self._known: dict[str, dict] = {}
         self._shorts: set[str] = set()              # ids being opened for the Shorts page (waiting or running)
         self._short_run: set[str] = set()           # ... the ones being fetched right now
@@ -467,7 +472,9 @@ class YoutubeController(QObject):
         if channels:
             self._job("channels", lambda: self._dlp.search_channels(query), replace=True)
         else:
+            self._pl_results = []
             self._job("search", lambda: self._dlp.search(query), replace=True)
+            self._job("plsearch", lambda: self._dlp.search_playlists(query, 12), replace=True)     # playlists that match show above the videos
 
     @Slot(str, result=bool)
     def openUrl(self, text: str):
@@ -546,7 +553,26 @@ class YoutubeController(QObject):
     def playInPlaylist(self, vid: str):
         """Play a video from the open playlist; the rest of the list follows it."""
         self._queue = [v["id"] for v in self._playlist.get("videos", [])]
+        self._queue_info = list(self._playlist.get("videos", []))
+        self._queue_title = self._playlist.get("title", "")
         self.play(vid)
+
+    @Property("QVariant", notify=changed)
+    def queue(self):
+        """The playlist being played, for the list beside the picture: {title, videos}. Empty when no playlist is playing."""
+        if not self._queue:
+            return {"title": "", "videos": []}
+        return {"title": self._queue_title, "videos": self._dress(self._queue_info)}
+
+    @Property(bool, notify=changed)
+    def queueOpen(self):
+        return self._queue_open
+
+    @Slot(bool)
+    def setQueueOpen(self, on: bool):
+        if on != self._queue_open:
+            self._queue_open = on
+            self.changed.emit()
 
     def _neighbor(self, vid: str, delta: int) -> str:
         try:
@@ -758,6 +784,68 @@ class YoutubeController(QObject):
         from the start of the recording. {} when it is not being recorded."""
         info = self._c.yt_info.get(f"yt:{video_id}") or {}
         return self._proxy.dvr_status(info.get("url", "")) or {}
+
+    @Slot(str, float)
+    def historyOpen(self, video_id: str, offset: float):
+        """Play a live stream from `offset` seconds after the first piece YouTube still lists (0 = the very beginning of what it keeps).
+        Answers with historyReady (the address, where it starts, how long the stretch is) or historyFailed. Nothing is recorded: the pieces
+        are fetched from YouTube as they play, so any point in the stretch can be opened at once."""
+        import sys
+        import threading
+        import urllib.request
+
+        def work():
+            try:
+                hist = self.__dict__.setdefault("_hist", {})
+                # first choice: the numbered pieces the website uses, which go back to the true beginning of the broadcast
+                numbered = hist.get(("n", video_id))
+                if numbered is None:
+                    numbered = hist[("n", video_id)] = self._numbered_pieces(video_id)
+                if numbered:
+                    try:
+                        with urllib.request.urlopen(f"{numbered}/info", timeout=60) as r:
+                            total = float(r.headers.get("X-Total-Seconds") or 0)
+                        if total > 0:
+                            at = max(0.0, min(offset, total))
+                            url = self._proxy.retimed(f"{numbered}/dash?from={at:.1f}")
+                            print(f"[history] {video_id}: opening {at:.0f}s into the {total / 60:.0f} minutes since the broadcast began", file=sys.stderr, flush=True)
+                            self.historyReady.emit(video_id, url, at, total)
+                            return
+                    except Exception as e:
+                        print(f"[history] {video_id}: numbered pieces failed ({e}); using the playlist instead", file=sys.stderr, flush=True)
+                        hist[("n", video_id)] = False
+                local = hist.get(video_id)
+                if not local:
+                    url, headers = self._live_address(video_id)
+                    local = hist[video_id] = self._proxy.add_live(url, headers, refresh=lambda: self._live_address(video_id))
+                with urllib.request.urlopen(f"{local}?from={max(0.0, offset):.1f}", timeout=30) as r:
+                    total = float(r.headers.get("X-Total-Seconds") or 0)
+                if total <= 0:
+                    raise RuntimeError("YouTube listed no earlier part of this stream")
+                url = self._proxy.retimed(f"{local}?from={max(0.0, offset):.1f}")
+                print(f"[history] {video_id}: opening {offset:.0f}s into the {total / 60:.0f} minutes YouTube lists of this stream", file=sys.stderr, flush=True)
+                self.historyReady.emit(video_id, url, max(0.0, min(offset, total)), total)
+            except Exception as e:
+                print(f"[history] could not open the earlier part of {video_id}: {e}", file=sys.stderr, flush=True)
+                self.historyFailed.emit(video_id, "Could not open the earlier part of this broadcast.")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _numbered_pieces(self, video_id: str) -> str:
+        """The local address of a running live stream's numbered pieces (reaching its true beginning), or "" when YouTube does not offer them."""
+        import sys
+        from ..core import dashstart
+        from ..core.streamproxy import retime_enabled
+        from ..core.youtube import js_runtime_args
+        if not retime_enabled():
+            return ""
+        exe = self._dlp.exe
+        try:
+            v, a, h = dashstart.resolve(exe, video_id, js_runtime_args())
+        except Exception as e:
+            print(f"[history] {video_id}: no numbered pieces ({e})", file=sys.stderr, flush=True)
+            return ""
+        print(f"[history] {video_id}: numbered pieces found", file=sys.stderr, flush=True)
+        return self._proxy.add_dash(dashstart.DashSource(v, a, h, refresh=lambda: dashstart.resolve(exe, video_id, js_runtime_args())))
 
     def _live_address(self, video_id: str):
         """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""

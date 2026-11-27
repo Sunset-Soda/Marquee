@@ -1,4 +1,5 @@
 import os
+import re
 import struct
 import sys
 import random
@@ -2962,6 +2963,26 @@ class TwitchRecorderTests(unittest.TestCase):
                               get=lambda u: u.encode(), folder=folder)
         return rec, folder
 
+
+    def test_a_channel_going_offline_keeps_what_was_recorded(self):
+        rec, folder = self.make()
+        for self.n in range(4, 20):
+            rec.step()
+        def gone(u):
+            raise OSError("offline")
+        rec._fetch = gone
+        rec._poll = 0.0
+        rec._thread = __import__("threading").Thread(target=rec._run, daemon=True)
+        rec.start()
+        rec._thread.join(10)
+        self.assertTrue(rec.ended)
+        self.assertFalse(rec.stopped)
+        self.assertTrue(os.path.isfile(os.path.join(folder, "000005.ts")))       # the pieces are still there
+        self.assertIn("#EXT-X-ENDLIST", rec.text())                               # so it plays through and stops like a recording
+        self.assertTrue(rec.status()["alive"])
+        rec.stop()
+        self.assertFalse(os.path.isdir(folder))                                   # and goes when the page is closed
+
     def test_keeps_everything_that_scrolled_out(self):
         rec, folder = self.make()
         for self.n in range(4, 40):
@@ -3048,3 +3069,267 @@ class TwitchRecorderTests(unittest.TestCase):
                 urllib.request.urlopen(base + "..%2Fx", timeout=5)
         finally:
             proxy.stop()
+
+
+class FromTheStartTests(unittest.TestCase):
+    """Opening a live YouTube stream at any earlier point (its playlist lists everything YouTube still keeps)."""
+
+    @staticmethod
+    def long_playlist(n=100, dur=2.0):
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:500"]
+        for i in range(n):
+            lines += [f"#EXTINF:{dur:.3f},", f"http://x/sq/{500 + i}/p.ts"]
+        return lines
+
+    def test_a_playlist_can_begin_part_way_in(self):
+        from marquee.core.streamproxy import _Handler
+        lines = self.long_playlist(100)
+        out, total = _Handler._from_offset(lines, 60)
+        self.assertEqual(total, 196.0)                                  # 100 pieces of 2 s, minus the two the stream is not serving yet
+        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:530")           # 60 s in = piece 30
+        self.assertEqual(out[4:6], ["#EXTINF:2.000,", "http://x/sq/530/p.ts"])
+        self.assertEqual(out[-1], "http://x/sq/597/p.ts")               # the newest two are held back
+        out, _ = _Handler._from_offset(lines, 0)
+        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:500")
+        out, _ = _Handler._from_offset(lines, 10_000)                   # past the end: the last piece, never an empty playlist
+        self.assertEqual(sum(1 for l in out if l.startswith("#EXTINF")), 1)
+        self.assertEqual(_Handler._live_edge(lines)[3], "#EXT-X-MEDIA-SEQUENCE:586")   # the usual start at the live edge is unchanged
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg") and "libx264" in os.popen("ffmpeg -hide_banner -encoders 2>/dev/null").read(),
+                         "needs ffmpeg with libx264")
+    def test_a_viewer_can_start_anywhere_in_the_past(self):
+        import functools
+        import http.server
+        import subprocess
+        from marquee.core import streamproxy
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=60",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=60", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac",
+                            "-f", "hls", "-hls_time", "2", "-hls_list_size", "0", "-hls_flags", "omit_endlist",
+                            os.path.join(d, "src", "live.m3u8")], check=True)           # a stream that has been going for a minute
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=os.path.join(d, "src"))
+            handler.func.log_message = lambda *a: None
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            proxy = streamproxy.StreamProxy()
+            try:
+                local = proxy.add_live(f"http://127.0.0.1:{web.server_address[1]}/live.m3u8")
+                r = urllib.request.urlopen(local + "?from=20", timeout=10)
+                total = float(r.headers["X-Total-Seconds"])
+                r.close()
+                self.assertGreater(total, 50)
+                got = {}
+                for off in (0, 30):
+                    url = proxy.retimed(f"{local}?from={off}")
+                    out = os.path.join(d, f"o{off}.ts")
+                    with open(out, "wb") as f:
+                        try:
+                            with urllib.request.urlopen(url, timeout=8) as r:
+                                while True:                                              # until the pieces run out and it waits for new ones
+                                    c = r.read(65536)
+                                    if not c:
+                                        break
+                                    f.write(c)
+                        except OSError:
+                            pass
+                    got[off] = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out],
+                                                    capture_output=True, text=True).stdout.strip() or 0)
+                self.assertAlmostEqual(got[0], total, delta=3)                           # everything YouTube lists
+                self.assertAlmostEqual(got[30], total - 30, delta=3)                     # just what is after 30 seconds
+            finally:
+                proxy.stop()
+                web.shutdown()
+
+
+class NumberedPiecesTests(unittest.TestCase):
+    """Playing a running YouTube stream from its true beginning, through the numbered pieces the website uses."""
+
+    @staticmethod
+    def box(kind, payload=b""):
+        return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+
+    def test_a_piece_gives_up_its_header_after_the_first(self):
+        from marquee.core.dashstart import split_init
+        init = self.box(b"ftyp", b"isom") + self.box(b"moov", b"x" * 20)
+        body = self.box(b"emsg", b"e") + self.box(b"moof", b"m") + self.box(b"mdat", b"d" * 9)
+        head, rest = split_init(init + body)
+        self.assertEqual(head, init + self.box(b"emsg", b"e"))
+        self.assertTrue(rest.startswith(self.box(b"moof", b"m")))
+        self.assertEqual(split_init(b"junk"), (b"", b"junk"))
+
+    def test_picks_h264_picture_and_aac_sound_from_the_start(self):
+        from marquee.core.dashstart import pick_formats
+        f = lambda **k: dict({"is_from_start": True, "url": "u"}, **k)       # noqa: E731
+        info = {"formats": [
+            f(format_id="308", vcodec="vp9", acodec="none", ext="webm", height=1440),
+            f(format_id="299", vcodec="avc1.4D402A", acodec="none", ext="mp4", height=1080),
+            f(format_id="298", vcodec="avc1.4D4020", acodec="none", ext="mp4", height=720),
+            f(format_id="139", vcodec="none", acodec="mp4a.40.5", ext="m4a"),
+            f(format_id="140", vcodec="none", acodec="mp4a.40.2", ext="m4a"),
+            {"format_id": "hls", "vcodec": "avc1", "ext": "mp4", "url": "u", "height": 1080}]}
+        v, a = pick_formats(info)
+        self.assertEqual((v["format_id"], a["format_id"]), ("299", "140"))
+        self.assertEqual(pick_formats({"formats": [f(format_id="308", vcodec="vp9", acodec="none", ext="webm", height=1440)]}), (None, None))
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg") and "libx264" in os.popen("ffmpeg -hide_banner -encoders 2>/dev/null").read(),
+                         "needs ffmpeg with libx264")
+    def test_any_point_opens_from_numbered_pieces(self):
+        import http.server
+        import subprocess
+        from marquee.core import streamproxy
+        from marquee.core.dashstart import DashSource
+        with tempfile.TemporaryDirectory() as d:
+            kinds = {}
+            for k, args in (("v", ["-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-an"]),
+                            ("a", ["-f", "lavfi", "-i", "sine=frequency=440:duration=40", "-c:a", "aac", "-vn"])):
+                out = os.path.join(d, k + ".mp4")
+                subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", *args, "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                                "-frag_duration", "2000000", out], check=True)
+                data = open(out, "rb").read()
+                boxes, i = [], 0
+                while i < len(data):
+                    size = int.from_bytes(data[i:i + 4], "big")
+                    boxes.append((data[i + 4:i + 8], data[i:i + size]))
+                    i += size
+                init = b"".join(b for t, b in boxes if t in (b"ftyp", b"moov"))
+                frags, cur = [], b""
+                for t, b in boxes:
+                    if t in (b"moof", b"mdat"):
+                        cur += b
+                        if t == b"mdat":
+                            frags.append(cur)
+                            cur = b""
+                kinds[k] = [init + f for f in frags]
+            n = len(kinds["a"])                                          # pieces numbered 0..n-1, about two seconds each
+
+            class Fake(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *a):
+                    pass
+
+                def do_GET(self):
+                    m = re.match(r"/(v|a)\?sq=(\d+)", self.path)
+                    k, sq = m.group(1), int(m.group(2))
+                    if sq >= n:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    body = kinds[k][sq]
+                    self.send_response(200)
+                    self.send_header("X-Head-Seqnum", str(n - 1))
+                    self.send_header("X-Head-Time-Millis", str((n - 1) * 2000))
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{web.server_address[1]}"
+            proxy = streamproxy.StreamProxy()
+            try:
+                local = proxy.add_dash(DashSource(base + "/v", base + "/a", patience=2))
+                with urllib.request.urlopen(local + "/info", timeout=10) as r:
+                    total = float(r.headers["X-Total-Seconds"])
+                self.assertAlmostEqual(total, (n - 3) * 2.0, delta=0.5)          # the newest two pieces are held back
+                got = {}
+                for off in (0, 20):
+                    url = proxy.retimed(f"{local}/dash?from={off}")
+                    out = os.path.join(d, f"o{off}.ts")
+                    with open(out, "wb") as f:
+                        try:
+                            with urllib.request.urlopen(url, timeout=25) as r:
+                                while True:
+                                    c = r.read(65536)
+                                    if not c:
+                                        break
+                                    f.write(c)
+                        except OSError:
+                            pass
+                    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "csv=p=0", out],
+                                           capture_output=True, text=True).stdout
+                    got[off] = (float(probe.strip().splitlines()[-1] or 0), "video" in probe and "audio" in probe)
+                self.assertTrue(got[0][1] and got[20][1])                         # picture and sound both arrive
+                self.assertGreater(got[0][0], 30)                                 # from the beginning to the newest piece it plays
+                self.assertAlmostEqual(got[0][0] - got[20][0], 20, delta=3)       # starting 20 s in leaves 20 s fewer
+            finally:
+                proxy.stop()
+                web.shutdown()
+
+
+class TwitchSavedBroadcastTests(unittest.TestCase):
+    """Rewinding a Twitch stream to its start through the saved copy Twitch builds while it is live."""
+
+    def vod(self, n=10, ended=False, mapped=False):
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:10", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:EVENT"]
+        if mapped:
+            lines.append('#EXT-X-MAP:URI="init.mp4"')
+        for i in range(n):
+            lines += ["#EXTINF:10.000,", f"{i}.ts"]
+        if ended:
+            lines.append("#EXT-X-ENDLIST")
+        return "\n".join(lines) + "\n"
+
+    def test_cut_starts_at_the_piece_holding_the_time(self):
+        out, total = twitch.cut_vod(self.vod(), "https://cdn.example/v/index.m3u8", 35)
+        self.assertEqual(total, 100.0)
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:3", out)                 # pieces 0-2 end by 30 s; piece 3 holds second 35
+        self.assertIn("https://cdn.example/v/3.ts", out)
+        self.assertNotIn("/2.ts", out)
+        self.assertNotIn("ENDLIST", out)                              # still growing: stays open-ended
+        self.assertIn("ENDLIST", twitch.cut_vod(self.vod(ended=True), "https://cdn.example/v/", 0)[0])
+
+    def test_cut_keeps_the_start_up_data_for_the_first_piece(self):
+        out, _ = twitch.cut_vod(self.vod(mapped=True), "https://cdn.example/v/index.m3u8", 55)
+        self.assertEqual(out.count("#EXT-X-MAP"), 1)
+        self.assertLess(out.index("#EXT-X-MAP"), out.index("https://cdn.example/v/5.ts"))
+        self.assertIn('URI="https://cdn.example/v/init.mp4"', out)
+
+    def test_cut_past_the_end_still_leaves_the_last_piece(self):
+        out, _ = twitch.cut_vod(self.vod(), "https://cdn.example/v/", 9999)
+        self.assertIn("https://cdn.example/v/9.ts", out)
+
+    def test_finds_the_saved_copy_of_this_stream(self):
+        calls = []
+
+        def api(path, **params):
+            calls.append(path)
+            if path == "users":
+                return {"data": [{"id": "42"}]}
+            if path == "streams":
+                return {"data": [{"id": "S2", "started_at": "2026-11-27T01:00:00Z"}]}
+            return {"data": [{"id": "V1", "stream_id": "S1", "created_at": "2026-11-26T01:00:00Z"},
+                             {"id": "V2", "stream_id": "S2", "created_at": "2026-11-27T01:00:05Z", "title": "tonight"}]}
+        self.assertEqual(twitch.current_vod(api, "x")["id"], "V2")
+        none = lambda path, **p: {"data": []} if path != "users" else {"data": [{"id": "1"}]}
+        self.assertIsNone(twitch.current_vod(none, "x"))                # offline, or nothing saved
+
+    def test_falls_back_to_the_creation_time(self):
+        def api(path, **params):
+            if path == "users":
+                return {"data": [{"id": "42"}]}
+            if path == "streams":
+                return {"data": [{"id": "S2", "started_at": "2026-11-27T01:00:00Z"}]}
+            return {"data": [{"id": "OLD", "created_at": "2026-11-25T01:00:00Z"}, {"id": "NEW", "created_at": "2026-11-27T01:00:30Z"}]}
+        self.assertEqual(twitch.current_vod(api, "x")["id"], "NEW")
+
+    def test_proxy_serves_the_cut_playlist(self):
+        import functools
+        import http.server
+        from marquee.core import streamproxy
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "index.m3u8"), "w") as f:
+                f.write(self.vod())
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=d)
+            handler.func.log_message = lambda *a: None
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            proxy = streamproxy.StreamProxy()
+            try:
+                url = proxy.add_vod(f"http://127.0.0.1:{web.server_address[1]}/index.m3u8")
+                r = urllib.request.urlopen(url + "?from=62", timeout=5)
+                body = r.read().decode()
+                self.assertEqual(r.headers["X-Total-Seconds"], "100.0")
+                self.assertIn("#EXT-X-MEDIA-SEQUENCE:6", body)
+                self.assertIn(f"http://127.0.0.1:{web.server_address[1]}/6.ts", body)
+            finally:
+                proxy.stop()
+                web.shutdown()
