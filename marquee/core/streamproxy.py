@@ -32,13 +32,16 @@ class Dvr:
     PIECE = 2          # seconds per piece
     IDLE = 40          # seconds with no viewer before the recording stops
 
-    def __init__(self, source: str, window: float | None = None, folder=None):
+    def __init__(self, source: str, window: float | None = None, folder=None, history: float = 0.0):
         import os
         import tempfile
         from pathlib import Path
         self.source = source
         mins = float(os.environ.get("MARQUEE_DVR_MINUTES") or 60)
         self.window = window if window is not None else mins * 60
+        self.history = history                # seconds of the stream that already exist behind the live edge, fetched from its first piece
+        if history:
+            self.window = max(self.window, history + 600)
         if folder is None:
             from .library import cache_dir
             base = cache_dir() / "live"
@@ -94,7 +97,8 @@ class Dvr:
             exe = ffmpeg_path()
             if not exe:
                 return
-            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", self.source, "-map", "0:v:0", "-map", "0:a:0?",
+            first = ["-live_start_index", "0"] if self.history else []        # begin at the first piece the playlist lists, not three from its end
+            cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *first, "-i", self.source, "-map", "0:v:0", "-map", "0:a:0?",
                    "-c", "copy", "-f", "segment", "-segment_time", str(self.PIECE), "-segment_format", "mpegts",
                    "-segment_list", str(self.list), "-segment_list_type", "csv", "-segment_list_flags", "live",
                    str(self.dir / "p%06d.ts")]
@@ -277,7 +281,7 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     @staticmethod
-    def _live_edge(lines: list, keep: int = 12, hold: int = 2) -> list:
+    def _live_edge(lines: list, keep: int = 12, hold: int = 2, seconds: float = 0.0) -> list:
         """A YouTube live playlist holds the whole DVR window (1600+ pieces, about 2 MB). Keep only the newest few so the player
         starts at the live point, and move the media sequence number along with what was dropped."""
         if any(l.startswith("#EXT-X-ENDLIST") for l in lines):
@@ -292,11 +296,27 @@ class _Handler(BaseHTTPRequestHandler):
             if l.strip() and not l.startswith("#"):
                 groups.append(cur)
                 cur = []
-        if len(groups) <= keep + hold:
+        if seconds:                                       # keep as many of the newest pieces as cover this many seconds (all of them if fewer)
+            def length(g):
+                for l in g:
+                    if l.startswith("#EXTINF:"):
+                        try:
+                            return float(l[8:].split(",")[0])
+                        except ValueError:
+                            pass
+                return 0.0
+            usable = groups[:len(groups) - hold] if hold else groups
+            total, keep = 0.0, 0
+            for g in reversed(usable):
+                if total >= seconds:
+                    break
+                total += length(g)
+                keep += 1
+        if len(groups) <= keep + hold and not seconds:
             return lines
         # the newest pieces are listed before YouTube will serve them (403), so stay a couple of pieces behind
         groups = groups[:len(groups) - hold] if hold else groups
-        dropped = len(groups) - keep
+        dropped = max(0, len(groups) - keep)
         head = [re.sub(r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)", lambda m: m.group(1) + str(int(m.group(2)) + dropped), l) for l in head]
         kept = [l for g in groups[dropped:] for l in g]
         return head + kept
@@ -387,7 +407,7 @@ class _Handler(BaseHTTPRequestHandler):
                         line = local(line.strip(), "index.m3u8" if was_variant else "seg.ts")
                         was_variant = False
                     out.append(line)
-                out = self._live_edge(out)
+                out = self._live_edge(out, seconds=getattr(self.server, "live_history", {}).get(token, 0.0))
                 nums = [int(x) for x in re.findall(r"%2Fsq%2F(\d+)%2F", "\n".join(out))]
                 if nums and getattr(self.server, "_live_seen", None) != (nums[0], nums[-1]):
                     self.server._live_seen = (nums[0], nums[-1])              # type: ignore[attr-defined]
@@ -768,7 +788,7 @@ class StreamProxy:
         s.entries[token] = ("url", url, dict(headers or {}))     # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}"
 
-    def add_live(self, url: str, headers: dict | None = None, refresh=None, every: float = 10.0) -> str:
+    def add_live(self, url: str, headers: dict | None = None, refresh=None, every: float = 10.0, history: float = 0.0) -> str:
         """The local address of a live HLS playlist that is fetched with `headers` (its pieces too).
 
         YouTube only honours a live address for about a dozen pieces past the moment it was made, so `refresh()` (returning
@@ -777,6 +797,10 @@ class StreamProxy:
         self._n += 1
         token = f"s{self._n}"
         s.entries[token] = ("live", url, dict(headers or {}))    # type: ignore[attr-defined]
+        if history:                                              # hand the recorder this many seconds of what is already behind the live edge
+            if not hasattr(s, "live_history"):
+                s.live_history = {}                              # type: ignore[attr-defined]
+            s.live_history[token] = history                      # type: ignore[attr-defined]
         if refresh:
             if not hasattr(s, "live_refresh"):
                 s.live_refresh = {}                              # type: ignore[attr-defined]
@@ -801,7 +825,7 @@ class StreamProxy:
         s.entries[token] = ("retime", local_url)                  # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}/live.ts"
 
-    def dvr(self, local_url: str) -> str:
+    def dvr(self, local_url: str, history: float = 0.0) -> str:
         """`local_url` (one of this proxy's own addresses) recorded as it plays, so it can be paused, rewound and sent back to live.
         Add ?back=SECONDS to start that far behind live. Falls back to plain pass-through when ffmpeg is missing or switched off."""
         if not retime_enabled() or os.environ.get("MARQUEE_DVR") == "0":
@@ -810,8 +834,15 @@ class StreamProxy:
         self._n += 1
         token = f"d{self._n}"
         s.entries[token] = ("dvr",)                                # type: ignore[attr-defined]
-        s.dvrs[token] = Dvr(local_url)                             # type: ignore[attr-defined]
+        s.dvrs[token] = Dvr(local_url, history=history)            # type: ignore[attr-defined]
         return f"http://127.0.0.1:{s.server_address[1]}/{token}/live.ts"
+
+    def stop_dvr(self, url: str) -> None:
+        """Stop and clear the recording behind this address (one that dvr() returned)."""
+        m = re.search(r"/(d\d+)/", url or "")
+        d = self._server.dvrs.get(m.group(1)) if m and self._server else None      # type: ignore[attr-defined]
+        if d:
+            d.stop()
 
     def dvr_status(self, url: str) -> dict | None:
         """The recording's state for an address made by dvr(), or None for anything else."""

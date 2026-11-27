@@ -3048,3 +3048,68 @@ class TwitchRecorderTests(unittest.TestCase):
                 urllib.request.urlopen(base + "..%2Fx", timeout=5)
         finally:
             proxy.stop()
+
+
+class FromTheStartTests(unittest.TestCase):
+    """Going back to where a live stream began (YouTube keeps its whole recent past in the playlist)."""
+
+    @staticmethod
+    def long_playlist(n=100, dur=2.0):
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:500"]
+        for i in range(n):
+            lines += [f"#EXTINF:{dur:.3f},", f"http://x/sq/{500 + i}/p.ts"]
+        return lines
+
+    def test_edge_can_keep_a_number_of_seconds(self):
+        from marquee.core.streamproxy import _Handler
+        lines = self.long_playlist(100)
+        out = _Handler._live_edge(lines, seconds=60)
+        self.assertEqual(sum(1 for l in out if l.startswith("#EXTINF")), 30)          # 60 s of 2 s pieces
+        self.assertEqual(out[3], "#EXT-X-MEDIA-SEQUENCE:568")                         # 100 listed, 2 held back, 30 kept: starts at 98 - 30
+        self.assertEqual(out[-1], "http://x/sq/597/p.ts")                             # the newest two are held back
+        everything = _Handler._live_edge(lines, seconds=100000)
+        self.assertEqual(everything, lines[:-4])                                      # nothing dropped but the two held back pieces
+        self.assertEqual(_Handler._live_edge(lines)[3], "#EXT-X-MEDIA-SEQUENCE:586")  # the usual short cut is unchanged
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg") and "libx264" in os.popen("ffmpeg -hide_banner -encoders 2>/dev/null").read(),
+                         "needs ffmpeg with libx264")
+    def test_recording_begins_at_the_first_piece_when_asked(self):
+        import functools
+        import http.server
+        import subprocess
+        from marquee.core import streamproxy
+        old = os.environ.get("XDG_CACHE_HOME")
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["XDG_CACHE_HOME"] = d
+            os.makedirs(os.path.join(d, "src"))
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=60",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=60", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac",
+                            "-f", "hls", "-hls_time", "2", "-hls_list_size", "0", "-hls_flags", "omit_endlist",
+                            os.path.join(d, "src", "live.m3u8")], check=True)           # a stream that has been going for a minute
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=os.path.join(d, "src"))
+            handler.func.log_message = lambda *a: None
+            web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=web.serve_forever, daemon=True).start()
+            proxy = streamproxy.StreamProxy()
+            try:
+                src = f"http://127.0.0.1:{web.server_address[1]}/live.m3u8"
+                plain = proxy.dvr(proxy.add_live(src))
+                full = proxy.dvr(proxy.add_live(src, history=3 * 3600), history=3 * 3600)
+                got = {}
+                for name, url in (("plain", plain), ("full", full)):
+                    r = urllib.request.urlopen(url + "?back=100000", timeout=60)
+                    r.read(20000)
+                    r.close()
+                    deadline = time.time() + 20
+                    while time.time() < deadline and (proxy.dvr_status(url) or {}).get("live", 0) < 40:
+                        time.sleep(0.3)
+                    got[name] = proxy.dvr_status(url)
+                self.assertLess(got["plain"]["live"], 30)                               # the usual recording only has the newest few pieces
+                self.assertGreaterEqual(got["full"]["live"], 40)                        # this one has the stream from its beginning
+                self.assertEqual(got["full"]["oldest"], 0.0)
+            finally:
+                proxy.stop()
+                if old is None:
+                    os.environ.pop("XDG_CACHE_HOME", None)
+                else:
+                    os.environ["XDG_CACHE_HOME"] = old

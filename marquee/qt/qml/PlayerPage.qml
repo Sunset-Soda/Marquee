@@ -33,6 +33,10 @@ Kirigami.Page {
     // A live YouTube stream is recorded while it plays (see core/streamproxy.py Dvr), so it can be paused, rewound and sent back to live.
     property var dvr: ({})                          // {oldest, live, viewerStart, alive}: seconds from the start of the recording
     property int dvrOpens: 0
+    property string dvrUrl: ""                      // the recording that replaced the first one when "From the start" was pressed
+    property string dvrFor: ""
+    property bool startingOver: false
+    property bool dvrScrub: false                   // the rewind bar's handle is held
     readonly property bool dvrOn: !!info.isLive && !!info.dvr && !!dvr.alive
     // how far behind the live edge the picture is, in seconds
     readonly property real behind: dvrOn ? Math.max(0, dvr.live - (dvr.viewerStart + videoPlayer.position / 1000)) : 0
@@ -239,7 +243,7 @@ Kirigami.Page {
     // join the recording `back` seconds behind live (0 = the live edge) without asking YouTube for anything new
     function attach(back) {
         pausedAt = 0; liveStill = 0; liveLast = -1
-        videoPlayer.source = info.url + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
+        videoPlayer.source = (dvrFor === info.id && dvrUrl ? dvrUrl : info.url) + "?back=" + Math.max(0, Math.round(back)) + "&n=" + (++dvrOpens)
         videoPlayer.play()
     }
     function nudge(seconds) {                          // seconds > 0 goes forward
@@ -838,12 +842,33 @@ Kirigami.Page {
                     Layout.fillWidth: true
                     from: pp.dvr.oldest || 0
                     to: Math.max((pp.dvr.oldest || 0) + 1, pp.dvr.live || 0)
-                    onPressedChanged: if (!pressed) pp.attach(Math.max(0, pp.dvr.live - value))
-                    Binding { target: dvrSeek; property: "value"; value: Math.min(dvrSeek.to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000); when: !dvrSeek.pressed }
+                    // the handle follows the picture except while held; only a handle that was really moved rewinds
+                    function follow() { if (!pressed && !pp.dvrScrub) value = Math.min(to, (pp.dvr.viewerStart || 0) + videoPlayer.position / 1000) }
+                    Component.onCompleted: follow()
+                    onToChanged: follow()
+                    onFromChanged: follow()
+                    Connections { target: videoPlayer; function onPositionChanged() { dvrSeek.follow() } }
+                    onPressedChanged: {
+                        if (pressed) pp.dvrScrub = true
+                        else if (pp.dvrScrub) {
+                            var back = pp.dvr.live - value
+                            var now = pp.behind
+                            pp.dvrScrub = false
+                            if (Math.abs(back - now) > 3) pp.attach(Math.max(0, back)); else follow()
+                        }
+                    }
                     QQC2.ToolTip.text: "-" + pp.fmt(Math.max(0, pp.dvr.live - value))
                     QQC2.ToolTip.visible: pressed
                 }
                 QQC2.Label { text: pp.fmt(pp.dvr.live - pp.dvr.oldest) + " recorded" }
+                QQC2.ToolButton {
+                    text: pp.startingOver ? "Fetching…" : "⏮ From the start"
+                    enabled: !pp.startingOver
+                    visible: pp.dvrFor !== pp.info.id || pp.startingOver       // gone once the recording already starts at the beginning
+                    onClicked: { pp.startingOver = true; youtube.startFromBeginning(pp.info.id.substring(3)) }
+                    QQC2.ToolTip.text: "Go back to where the broadcast began (as far as YouTube keeps it, up to three hours)"
+                    QQC2.ToolTip.visible: hovered
+                }
             }
             RowLayout {
                 spacing: Kirigami.Units.largeSpacing
@@ -1118,6 +1143,19 @@ Kirigami.Page {
             QQC2.BusyIndicator { Layout.alignment: Qt.AlignHCenter; running: parent.visible }
             Text { Layout.alignment: Qt.AlignHCenter; text: "Loading video…"; color: "white"; font.pixelSize: 16 }
             Text { Layout.alignment: Qt.AlignHCenter; visible: youtube.note !== ""; text: "Downloading " + youtube.note; color: "#ccffffff"; font.pixelSize: 13 }
+        }
+    }
+    Connections {
+        target: youtube
+        function onDvrRestarted(vid, url) {
+            if (!pp.info.yt || pp.info.id !== "yt:" + vid) return
+            pp.startingOver = false
+            if (url) {
+                pp.dvrUrl = url
+                pp.dvrFor = pp.info.id
+                pp.dvr = ({})
+                pp.attach(100000000)                         // as far back as there is: the first piece
+            } else applicationWindow().showPassiveNotification("Could not go back to the start of this broadcast.")
         }
     }
     // YouTube started at 360p so it opened quickly; the bigger picture downloads behind it and replaces it when ready

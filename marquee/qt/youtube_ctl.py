@@ -19,6 +19,7 @@ class YoutubeController(QObject):
     _progress = Signal(str)
     imported = Signal(int, int)         # channels added, channels already subscribed
     ready = Signal(str)                 # a video's stream address is known: play "yt:<id>"
+    dvrRestarted = Signal(str, str)     # a live stream's recording now starts from the beginning: video id, the new address ("" if that failed)
     shortReady = Signal(str)            # the same for a Short, which plays inside the Shorts page instead
     shortFailed = Signal(str, str)      # a Short's id and why it could not be opened
     _done = Signal(str, object)
@@ -758,6 +759,39 @@ class YoutubeController(QObject):
         from the start of the recording. {} when it is not being recorded."""
         info = self._c.yt_info.get(f"yt:{video_id}") or {}
         return self._proxy.dvr_status(info.get("url", "")) or {}
+
+    @Slot(str)
+    def startFromBeginning(self, video_id: str):
+        """Record a live stream from the first piece YouTube still keeps (up to MARQUEE_DVR_START_MINUTES, default 180) instead of
+        from now, so the rewind bar reaches back to where the broadcast began. The recording is replaced; the page reopens it."""
+        import os
+        import sys
+        import threading
+        key = f"yt:{video_id}"
+
+        def work():
+            new = ""
+            try:
+                try:
+                    secs = float(os.environ.get("MARQUEE_DVR_START_MINUTES") or 180) * 60
+                except ValueError:
+                    secs = 180 * 60
+                url, headers = self._live_address(video_id)
+                local = self._proxy.add_live(url, headers, refresh=lambda: self._live_address(video_id), history=secs)
+                made = self._proxy.dvr(local, history=secs)
+                if self._proxy.dvr_status(made) is None:
+                    raise RuntimeError("recording is not available")
+                info = self._c.yt_info.get(key)
+                if info is not None:
+                    old = info.get("url", "")
+                    info["url"] = made
+                    self._proxy.stop_dvr(old)
+                new = made
+                print(f"[dvr] recording {video_id} from the beginning (up to {secs / 60:.0f} minutes back)", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[dvr] could not start from the beginning: {e}", file=sys.stderr, flush=True)
+            self.dvrRestarted.emit(video_id, new)
+        threading.Thread(target=work, daemon=True).start()
 
     def _live_address(self, video_id: str):
         """A fresh playlist address for a live stream that is playing (YouTube stops honouring one after about a dozen pieces)."""
