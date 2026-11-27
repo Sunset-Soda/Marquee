@@ -319,7 +319,8 @@ class Recorder:
             folder = tempfile.mkdtemp(prefix="twitch-", dir=str(root))
         self.folder = str(folder)
         self.base = ""                                      # the address the pieces are served from (set by the proxy)
-        self.segs: list[dict] = []                          # {n, key, pdt, dur, name}
+        self.segs: list[dict] = []                          # {n, key, pdt, dur, name, map}
+        self._inits: dict[str, str] = {}                    # start-up data address -> the name it is kept under
         self.ranges: dict[str, str] = {}                    # DATERANGE lines by id
         self.count = 0                                      # pieces saved so far (names them)
         self._seen: set[str] = set()
@@ -368,11 +369,24 @@ class Recorder:
             url = lines[-1]
             if url in self._seen:
                 continue
-            if mp or pdt is None:
-                self.unsupported = True                     # pieces that need start-up data, or carry no clock, cannot be stitched back
+            if pdt is None:
+                self.unsupported = True                     # pieces that carry no clock cannot be placed in time
                 return added
             if self.stopped:
                 break
+            init = ""
+            if mp:                                          # fragmented MP4: keep the start-up data the pieces depend on
+                m = re.search(r'URI="([^"]+)"', mp)
+                if not m:
+                    self.unsupported = True
+                    return added
+                iurl = urllib.parse.urljoin(self.url, m.group(1))
+                if iurl not in self._inits:
+                    name = "init%03d.mp4" % len(self._inits)
+                    with open(os.path.join(self.folder, name), "wb") as f:
+                        f.write(self._get(iurl))
+                    self._inits[iurl] = name
+                init = self._inits[iurl]
             data = self._get(url)
             dur = 2.0
             for ln in lines:
@@ -381,12 +395,12 @@ class Recorder:
                         dur = float(ln[8:].split(",")[0])
                     except ValueError:
                         pass
-            name = "%06d.ts" % self.count
+            name = "%06d.%s" % (self.count, "m4s" if init else "ts")
             with open(os.path.join(self.folder, name), "wb") as f:
                 f.write(data)
             with self._lock:
                 self._seen.add(url)
-                self.segs.append({"n": self.count, "key": url, "pdt": pdt, "dur": dur, "name": name,
+                self.segs.append({"n": self.count, "key": url, "pdt": pdt, "dur": dur, "name": name, "map": init,
                                   "disc": any(ln.startswith("#EXT-X-DISCONTINUITY") for ln in lines)})
                 self.count += 1
             added += 1
@@ -433,7 +447,7 @@ class Recorder:
             ranges = list(self.ranges.values())
         if not segs:
             return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
-        out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % (int(max(s["dur"] for s in segs)) + 1),
+        out = ["#EXTM3U", "#EXT-X-VERSION:%d" % (6 if any(s["map"] for s in segs) else 3), "#EXT-X-TARGETDURATION:%d" % (int(max(s["dur"] for s in segs)) + 1),
                "#EXT-X-MEDIA-SEQUENCE:%d" % segs[0]["n"]]
         t0 = segs[0]["pdt"]
         for r in ranges:
@@ -446,9 +460,13 @@ class Recorder:
             if end >= t0 - 1:
                 out.append(r)
         from datetime import datetime, timezone
+        cur = None
         for s in segs:
             if s["disc"]:
                 out.append("#EXT-X-DISCONTINUITY")
+            if s["map"] and (s["map"] != cur or s["disc"]):
+                out.append('#EXT-X-MAP:URI="%s"' % s["map"])
+            cur = s["map"]
             out.append("#EXT-X-PROGRAM-DATE-TIME:" + datetime.fromtimestamp(s["pdt"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
             out.append("#EXTINF:%.3f," % s["dur"])
             out.append(s["name"])
@@ -464,7 +482,7 @@ class Recorder:
 
     def file(self, name: str) -> str | None:
         self.touch()
-        if not re.fullmatch(r"\d{6}\.ts", name or ""):
+        if not re.fullmatch(r"\d{6}\.(ts|m4s)|init\d{3}\.mp4", name or ""):
             return None
         p = os.path.join(self.folder, name)
         return p if os.path.isfile(p) else None
@@ -566,6 +584,7 @@ def _parse(text: str, base: str):
                 pdt = None
             pending.append(line)
         elif line.startswith("#EXT-X-MAP"):
+            line = re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % urljoin(base, m.group(1)), line)   # a relative start-up address is relative to the playlist
             cur_map = line
             pending.append(line)
         elif line.startswith("#EXT-X-DATERANGE"):
@@ -753,6 +772,7 @@ def split_at(text: str, base: str, cut: float) -> tuple[str, str]:
                 pdt = None
             pending.append(line)
         elif line.startswith("#EXT-X-MAP"):
+            line = re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % urljoin(base, m.group(1)), line)   # a relative start-up address is relative to the playlist
             cur_map = line
             pending.append(line)
         elif line.startswith("#EXT-X-DATERANGE"):

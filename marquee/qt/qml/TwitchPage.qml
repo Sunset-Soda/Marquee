@@ -43,7 +43,7 @@ Kirigami.Page {
     function compact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "K" : String(n) }
 
     Component.onCompleted: { if (twitch.signedIn) twitch.refresh(); showSettings = !twitch.signedIn && twitch.clientId === "" }
-    Component.onDestruction: { player.stop(); twitch.stopRecording() }
+    Component.onDestruction: { player.stop(); if (twitch) twitch.stopRecording() }
 
     // ---- pause / rewind / Live (the channel is kept on disk while you watch) ----
     property var dvr: ({ alive: false })
@@ -321,13 +321,13 @@ Kirigami.Page {
                         text: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
                         onClicked: player.playbackState === MediaPlayer.PlayingState ? player.pause() : player.play()
                     }
+                    Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
                         text: "● Live"
                         highlighted: player.playbackState !== MediaPlayer.PlayingState || pg.behind > 10
                         onClicked: { if (pg.dvr.alive) pg.openMain(0); else pg.watch(twitch.channel) }
                         QQC2.ToolTip.text: "Jump back to the live broadcast"; QQC2.ToolTip.visible: hovered
                     }
-                    Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
                         icon.name: pg.muted || volSlider.value === 0 ? "player-volume-muted" : "player-volume"
                         display: QQC2.AbstractButton.IconOnly

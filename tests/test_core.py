@@ -2992,8 +2992,23 @@ class TwitchRecorderTests(unittest.TestCase):
         self.assertTrue(rec.file("%06d.ts" % rec.segs[-1]["n"]))
         self.assertIsNone(rec.file("../etc"))
 
-    def test_streams_that_cannot_be_stitched_are_refused(self):
-        rec, _ = self.make(mapped=True)
+    def test_fragmented_mp4_keeps_its_start_up_data(self):
+        rec, folder = self.make(mapped=True)
+        for self.n in range(4, 12):
+            rec.step()
+        self.assertFalse(rec.unsupported)
+        self.assertTrue(os.path.exists(os.path.join(folder, "init000.mp4")))
+        text = rec.text()
+        self.assertIn('#EXT-X-MAP:URI="init000.mp4"', text)
+        self.assertEqual(text.count("#EXT-X-MAP"), 1)        # named once, until it changes
+        _, segs, _ = twitch._parse(text, "http://127.0.0.1/t1/")
+        self.assertEqual(segs[0][2], '#EXT-X-MAP:URI="http://127.0.0.1/t1/init000.mp4"')
+        self.assertTrue(rec.file("000000.m4s"))
+        self.assertTrue(rec.file("init000.mp4"))
+
+    def test_pieces_without_a_clock_are_refused(self):
+        rec, _ = self.make()
+        rec._fetch = lambda u: "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nhttp://x/a.ts\n"
         rec.step()
         self.assertTrue(rec.unsupported)
         self.assertFalse(rec.usable())

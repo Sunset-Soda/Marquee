@@ -627,7 +627,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 size = os.path.getsize(f)
                 self.send_response(200)
-                self.send_header("Content-Type", "video/mp2t")
+                self.send_header("Content-Type", "video/mp2t" if f.endswith(".ts") else "video/mp4")
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
                 if not head:
