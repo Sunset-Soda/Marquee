@@ -2932,3 +2932,119 @@ class PassThroughTests(unittest.TestCase):
         finally:
             proxy.stop()
             quiet.close()
+
+
+class TwitchRecorderTests(unittest.TestCase):
+    T0 = 1_800_000_000.0
+
+    @staticmethod
+    def stamp(t):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def playlist(self, first, count, ad=None, mapped=False):
+        """What Twitch lists when the newest piece is number first+count-1 (pieces last 2 s)."""
+        out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:%d" % first]
+        if ad:
+            out.append('#EXT-X-DATERANGE:ID="ad1",CLASS="twitch-stitched-ad",START-DATE="%s",DURATION=%s' % (self.stamp(self.T0 + ad[0]), ad[1]))
+        for n in range(first, first + count):
+            if mapped:
+                out.append('#EXT-X-MAP:URI="http://x/init"')
+            out += ["#EXT-X-PROGRAM-DATE-TIME:" + self.stamp(self.T0 + n * 2), "#EXTINF:2.000,", "http://x/p%d.ts" % n]
+        return "\n".join(out) + "\n"
+
+    def make(self, window=3600.0, **kw):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        self.n = 4                                           # newest piece listed
+        ad = kw.get("ad")
+        rec = twitch.Recorder("http://x/live.m3u8", window=window, fetch=lambda u: self.playlist(self.n - 3, 4, ad, kw.get("mapped", False)),
+                              get=lambda u: u.encode(), folder=folder)
+        return rec, folder
+
+    def test_keeps_everything_that_scrolled_out(self):
+        rec, folder = self.make()
+        for self.n in range(4, 40):
+            rec.step()
+        self.assertEqual(len(rec.segs), 39)                  # twitch only ever lists 4 at a time (pieces 1 to 39)
+        _, segs, seq0 = twitch._parse(rec.text(), "http://127.0.0.1/t1/")
+        self.assertEqual(len(segs), 39)
+        self.assertEqual(seq0, 0)
+        self.assertTrue(segs[0][1][-1].endswith("/t1/000000.ts"))
+        self.assertEqual(open(os.path.join(folder, "000005.ts"), "rb").read(), b"http://x/p6.ts")
+        st = rec.status()
+        self.assertAlmostEqual(st["oldest"], self.T0 + 2, places=2)
+        self.assertAlmostEqual(st["live"], self.T0 + 80, places=2)
+
+    def test_break_survives_in_the_playlist(self):
+        rec, _ = self.make(ad=(20, 16.0))
+        for self.n in range(4, 30):
+            rec.step()
+        self.assertEqual(twitch.ad_windows(rec.text()), [(self.T0 + 20, self.T0 + 36)])
+
+    def test_old_pieces_are_dropped_past_the_window(self):
+        rec, folder = self.make(window=60)
+        for self.n in range(4, 100):
+            rec.step()
+        self.assertLess(len(rec.segs), 34)
+        self.assertGreater(len(rec.segs), 28)
+        self.assertFalse(os.path.exists(os.path.join(folder, "000000.ts")))
+        self.assertTrue(rec.file("%06d.ts" % rec.segs[-1]["n"]))
+        self.assertIsNone(rec.file("../etc"))
+
+    def test_fragmented_mp4_keeps_its_start_up_data(self):
+        rec, folder = self.make(mapped=True)
+        for self.n in range(4, 12):
+            rec.step()
+        self.assertFalse(rec.unsupported)
+        self.assertTrue(os.path.exists(os.path.join(folder, "init000.mp4")))
+        text = rec.text()
+        self.assertIn('#EXT-X-MAP:URI="init000.mp4"', text)
+        self.assertEqual(text.count("#EXT-X-MAP"), 1)        # named once, until it changes
+        _, segs, _ = twitch._parse(text, "http://127.0.0.1/t1/")
+        self.assertEqual(segs[0][2], '#EXT-X-MAP:URI="http://127.0.0.1/t1/init000.mp4"')
+        self.assertTrue(rec.file("000000.m4s"))
+        self.assertTrue(rec.file("init000.mp4"))
+
+    def test_pieces_without_a_clock_are_refused(self):
+        rec, _ = self.make()
+        rec._fetch = lambda u: "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nhttp://x/a.ts\n"
+        rec.step()
+        self.assertTrue(rec.unsupported)
+        self.assertFalse(rec.usable())
+
+    def test_seek_into_a_break_plays_the_break(self):
+        text = self.playlist(0, 30, ad=(20, 16.0))
+        st = twitch.AdState()
+        self.assertTrue(st.seek(text, self.T0 + 25))
+        self.assertEqual((st.floor, st.ad), (self.T0 + 20, (self.T0 + 20, self.T0 + 36)))
+        st.advance()
+        self.assertEqual(st.floor, self.T0 + 36)
+        self.assertFalse(st.seek(text, self.T0 + 5))
+        self.assertEqual(st.floor, self.T0 + 5)
+        main, n, beyond = st.main(text, "http://x/")
+        self.assertEqual(n, 7)                               # from 5 s to the break at 20 s: pieces at 6,8,...,18
+        self.assertGreater(beyond, 0)                        # the break has begun, so this part is complete
+
+    def test_proxy_serves_a_behind_viewer_from_disk(self):
+        from marquee.core import streamproxy
+        rec, _ = self.make(ad=(20, 16.0))
+        for self.n in range(4, 30):
+            rec.step()
+        proxy = streamproxy.StreamProxy()
+        try:
+            base = proxy.add_rec(rec)
+            state = twitch.AdState()
+            state.rec = rec
+            state.seek(rec.text(), self.T0 + 6)
+            url = proxy.add_hls("http://x/never-fetched.m3u8", "main", state)
+            body = urllib.request.urlopen(url, timeout=5).read().decode()
+            self.assertIn("ENDLIST", body)                   # the break is already listed, so the part before it is complete
+            self.assertIn(base + "000002.ts", body)
+            self.assertNotIn("000010.ts", body)
+            data = urllib.request.urlopen(base + "000002.ts", timeout=5).read()
+            self.assertEqual(data, b"http://x/p3.ts")
+            with self.assertRaises(urllib.error.HTTPError):
+                urllib.request.urlopen(base + "..%2Fx", timeout=5)
+        finally:
+            proxy.stop()

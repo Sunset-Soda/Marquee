@@ -242,11 +242,15 @@ class _Handler(BaseHTTPRequestHandler):
         import time
         from . import twitch
         deadline = time.time() + 20
+        rec = getattr(state, "rec", None)
         while True:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": twitch.UA})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    text = r.read(600_000).decode("utf-8", "replace")
+                if rec is not None:
+                    text, url = rec.text(), rec.base                # the recording stands in for the live playlist
+                else:
+                    req = urllib.request.Request(url, headers={"User-Agent": twitch.UA})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        text = r.read(600_000).decode("utf-8", "replace")
                 body, n, beyond = state.ad_part(text, url) if part == "ad" else state.main(text, url)
             except Exception:
                 self.send_error(502)
@@ -465,7 +469,12 @@ class _Handler(BaseHTTPRequestHandler):
         exe = ffmpeg_path()
         if not exe:
             return
-        cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
+        first = []
+        m = re.match(r"http://127\.0\.0\.1:\d+/(s\d+)$", source)
+        ent = self.server.entries.get(m.group(1)) if m else None   # type: ignore[attr-defined]
+        if ent and ent[0] == "hls":
+            first = ["-live_start_index", "0", "-analyzeduration", "1500000", "-probesize", "1500000"]                    # start at the first piece listed (a rewound spot), not three from the end
+        cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", *first, "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
                "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
@@ -609,6 +618,24 @@ class _Handler(BaseHTTPRequestHandler):
         if entry[0] == "retime":
             self._serve_retimed(head, entry[1])
             return
+        if entry[0] == "rec":
+            parts = self.path.split("?")[0].strip("/").split("/")
+            f = entry[1].file(parts[1]) if len(parts) > 1 else None
+            if not f:
+                self.send_error(404)
+                return
+            try:
+                size = os.path.getsize(f)
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t" if f.endswith(".ts") else "video/mp4")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                if not head:
+                    with open(f, "rb") as fh:
+                        self.wfile.write(fh.read())
+            except OSError:
+                pass
+            return
         if entry[0] == "dvr":
             self._serve_dvr(head, self.path.split("?")[0].strip("/").split("/")[0])
             return
@@ -729,6 +756,9 @@ class StreamProxy:
         if self._server:
             for d in list(getattr(self._server, "dvrs", {}).values()):
                 d.stop()
+            for e in list(self._server.entries.values()):         # type: ignore[attr-defined]
+                if e[0] == "rec":
+                    e[1].stop()
 
     def add(self, url: str, headers: dict | None = None) -> str:
         """The local address that plays `url`."""
@@ -791,6 +821,15 @@ class StreamProxy:
         d = self._server.dvrs.get(m.group(1)) if m else None      # type: ignore[attr-defined]
         return d.status() if d else None
 
+    def add_rec(self, rec) -> str:
+        """Serve a core.twitch.Recorder's pieces; sets rec.base to their address and returns it."""
+        s = self._start()
+        self._n += 1
+        token = f"t{self._n}"
+        s.entries[token] = ("rec", rec)                            # type: ignore[attr-defined]
+        rec.base = f"http://127.0.0.1:{s.server_address[1]}/{token}/"
+        return rec.base
+
     def add_hls(self, url: str, part: str, state) -> str:
         """The local address of the channel ("main") or the current commercial break ("ad") of a live playlist; `state` is a core.twitch.AdState."""
         s = self._start()
@@ -801,7 +840,6 @@ class StreamProxy:
 
     def stop(self) -> None:
         if self._server:
-            for d in list(getattr(self._server, "dvrs", {}).values()):
-                d.stop()
+            self._stop_recordings()
             self._server.shutdown()
             self._server = None
