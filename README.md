@@ -35,6 +35,7 @@ Qt 6 + Kirigami. Native on KDE Plasma, and runs on any Linux desktop. A Windows 
 Grab the latest build from the **Releases** page:
 
 - **Linux:** `Marquee-x86_64.AppImage`. `chmod +x` it and run. Use a tool like Gear Lever to add it to your menu, or run it once with `--install-desktop` (and `--uninstall-desktop` to remove the entry). It uses your system's Qt 6 and Kirigami (see Install).
+  **Updates:** open Settings (Ctrl+,) > Updates. Marquee checks GitHub for a newer release (once at start-up, which you can turn off) and the AppImage can replace itself; other installs get a link to the release page.
 
 ## Install from source
 
