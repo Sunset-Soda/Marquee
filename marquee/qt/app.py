@@ -28,6 +28,7 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
     from .shorts_ctl import ShortsController
     from .podcasts_ctl import PodcastsController
     from .twitch_ctl import TwitchController
+    from .updater_ctl import UpdaterController
     from .ytmusic_ctl import YtMusicController
 
     # Send everything Qt and QML print (console.log included) through Python's stderr, so it reaches the log file as well as
@@ -85,6 +86,8 @@ def run(files: list[str], qt_args: list[str], dt: Desktop) -> int:
     engine.rootContext().setContextProperty("podcasts", podcasts)
     twitch = TwitchController(youtube)
     engine.rootContext().setContextProperty("twitch", twitch)
+    updates = UpdaterController(controller)
+    engine.rootContext().setContextProperty("updater", updates)
     engine.rootContext().setContextProperty("desktopName", dt.label)
     engine.load(QUrl.fromLocalFile(str(Path(__file__).parent / "qml" / "Main.qml")))
     if not engine.rootObjects():

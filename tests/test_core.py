@@ -3255,6 +3255,86 @@ class NumberedPiecesTests(unittest.TestCase):
                 web.shutdown()
 
 
+class UpdaterTests(unittest.TestCase):
+    def test_versions_compare_by_number(self):
+        from marquee.core import updater as u
+        self.assertEqual(u.parse_version("v1.3.6"), (1, 3, 6))
+        self.assertEqual(u.parse_version("2.0-rc1"), (2, 0))
+        self.assertEqual(u.parse_version("nightly"), ())
+        self.assertTrue(u.is_newer("1.3.10", "1.3.9"))                 # not alphabetical
+        self.assertTrue(u.is_newer("v1.4", "1.3.6"))
+        self.assertFalse(u.is_newer("1.3.6", "1.3.6"))
+        self.assertFalse(u.is_newer("1.3", "1.3.0"))
+        self.assertFalse(u.is_newer("1.2.9", "1.3.0"))
+        self.assertFalse(u.is_newer("garbage", "1.3.0"))
+
+    def test_reads_the_latest_release(self):
+        from marquee.core import updater as u
+        data = {"tag_name": "1.3.7", "body": "Fixes", "html_url": "https://github.com/x/releases/1.3.7",
+                "assets": [{"name": "appimagetool-x86_64.AppImage", "browser_download_url": "https://x/tool", "size": 5},
+                           {"name": u.ASSET, "browser_download_url": u.DOWNLOADS + "1.3.7/" + u.ASSET, "size": 99, "digest": "sha256:abc"}]}
+        info = u.check("1.3.6", fetch=lambda url: data)
+        self.assertTrue(info["newer"])
+        self.assertEqual((info["latest"], info["size"], info["sha256"]), ("1.3.7", 99, "abc"))
+        self.assertTrue(info["asset"].endswith("/" + u.ASSET))
+        self.assertFalse(u.check("1.3.7", fetch=lambda url: data)["newer"])
+        with self.assertRaises(ValueError):
+            u.check("1.3.6", fetch=lambda url: {"tag_name": "latest"})
+
+    def test_only_an_appimage_that_can_be_replaced_updates_itself(self):
+        from marquee.core import updater as u
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "Marquee.AppImage")
+            open(f, "wb").write(b"x")
+            self.assertEqual(u.appimage_path({"APPIMAGE": f}), f)
+            self.assertEqual(u.appimage_path({"APPIMAGE": os.path.join(d, "missing")}), "")
+            self.assertEqual(u.appimage_path({}), "")
+
+    def test_installs_only_a_download_that_checks_out(self):
+        import hashlib
+        import http.server
+        from marquee.core import updater as u
+        good = b"\x7fELF" + b"new program" * 1000
+        bad = b"<html>not a program</html>"
+        served = {"/ok": good, "/html": bad}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = served[self.path]
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=web.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{web.server_address[1]}"
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                target = os.path.join(d, "Marquee.AppImage")
+                open(target, "wb").write(b"\x7fELFold")
+                os.chmod(target, 0o755)
+                seen = []
+                digest = hashlib.sha256(good).hexdigest()
+                # each of these must leave the installed copy alone and clean up after itself
+                for path, size, sha in (("/html", len(bad), ""), ("/ok", len(good) + 1, ""), ("/ok", len(good), "0" * 64)):
+                    with self.assertRaises(ValueError):
+                        u.install(target, {"asset": base + path, "size": size, "sha256": sha}, allowed=base)
+                    self.assertEqual(open(target, "rb").read(), b"\x7fELFold")
+                    self.assertEqual(os.listdir(d), ["Marquee.AppImage"])
+                with self.assertRaises(ValueError):                                  # an address that is not GitHub's release download
+                    u.install(target, {"asset": base + "/ok", "size": len(good)})
+                u.install(target, {"asset": base + "/ok", "size": len(good), "sha256": digest}, progress=seen.append, allowed=base)
+                self.assertEqual(open(target, "rb").read(), good)
+                self.assertTrue(os.access(target, os.X_OK))
+                self.assertEqual(seen[-1], 1.0)
+                self.assertEqual(os.listdir(d), ["Marquee.AppImage"])
+        finally:
+            web.shutdown()
+
+
 class TwitchSavedBroadcastTests(unittest.TestCase):
     """Rewinding a Twitch stream to its start through the saved copy Twitch builds while it is live."""
 

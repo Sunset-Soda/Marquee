@@ -468,6 +468,65 @@ Kirigami.ApplicationWindow {
                     text: "Translucent window (lets blur show through; restart to apply)"
                     onToggled: marquee.setTranslucent(checked)
                 }
+                Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Updates" }
+                ColumnLayout {
+                    Kirigami.FormData.label: "Marquee " + updater.version
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    spacing: Kirigami.Units.smallSpacing
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: updater.state === "checking" ? "Checking for a newer version…"
+                            : updater.state === "uptodate" ? "You have the latest version."
+                            : updater.state === "available" ? "Version " + updater.latest + " is available."
+                            : updater.state === "downloading" ? "Downloading version " + updater.latest + "…"
+                            : updater.state === "ready" ? "Version " + updater.latest + " is installed. Restart Marquee to use it."
+                            : updater.state === "error" ? updater.message
+                            : "Check whether a newer version has been released."
+                    }
+                    QQC2.ProgressBar { Layout.fillWidth: true; visible: updater.state === "downloading"; from: 0; to: 1; value: updater.progress }
+                    QQC2.ScrollView {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Kirigami.Units.gridUnit * 7
+                        visible: updater.state === "available" && updater.notes.length > 0
+                        QQC2.TextArea { readOnly: true; wrapMode: Text.Wrap; text: updater.notes; font: Kirigami.Theme.smallFont; background: null }
+                    }
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        visible: updater.state === "available" && !updater.canInstall
+                        wrapMode: Text.Wrap
+                        opacity: 0.7
+                        font: Kirigami.Theme.smallFont
+                        text: "This copy of Marquee is not an AppImage, so it can't replace itself. Open the release page to get the new version, or update it the way you installed it."
+                    }
+                    RowLayout {
+                        spacing: Kirigami.Units.smallSpacing
+                        QQC2.Button {
+                            text: "Check for Updates"
+                            visible: updater.state !== "available" && updater.state !== "ready" && updater.state !== "downloading"
+                            enabled: updater.state !== "checking"
+                            onClicked: updater.check()
+                        }
+                        QQC2.Button {
+                            text: "Update Now"
+                            highlighted: true
+                            visible: updater.state === "available" && updater.canInstall
+                            onClicked: updater.install()
+                        }
+                        QQC2.Button {
+                            text: "Open Release Page"
+                            visible: updater.state === "available" && !updater.canInstall
+                            highlighted: visible
+                            onClicked: updater.openPage()
+                        }
+                        QQC2.Button { text: "Restart Now"; highlighted: true; visible: updater.state === "ready"; onClicked: updater.restart() }
+                    }
+                }
+                QQC2.CheckBox {
+                    text: "Check for updates when Marquee starts"
+                    checked: updater.autoCheck
+                    onToggled: updater.setAutoCheck(checked)
+                }
                 Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Music" }
                 QQC2.ComboBox {
                     id: vizBox
